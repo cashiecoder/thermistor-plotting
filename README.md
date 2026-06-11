@@ -5,6 +5,9 @@ PyQt6 app for plotting the transistor measurements in `TransistorData`.
 ## Run
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+.venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python app.py
 ```
 
