@@ -11,3 +11,5 @@ outputs/
 *.png
 *.pdf
 DiramicsTransistorNotes.txt
+tmp/
+*.zip

@@ -13,6 +13,7 @@ from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -150,6 +151,18 @@ class MainWindow(QMainWindow):
 
         self.count_label = QLabel()
 
+        self.reference_checkbox = QCheckBox("Ideal MOSFET reference")
+        self.reference_checkbox.setToolTip("Overlay dashed textbook ideal MOSFET curves using explicit Vth and k.")
+        self.reference_checkbox.toggled.connect(self._set_reference_inputs_enabled)
+
+        self.reference_vth_edit = QLineEdit()
+        self.reference_vth_edit.setPlaceholderText("Vth (V)")
+        self.reference_vth_edit.setToolTip("Threshold voltage in volts. Required only when ideal reference is enabled.")
+
+        self.reference_k_edit = QLineEdit()
+        self.reference_k_edit.setPlaceholderText("k (mA/mm/V^2)")
+        self.reference_k_edit.setToolTip("Positive finite k in mA/mm/V^2. Required only when ideal reference is enabled.")
+
         self.plot_selected_button = QPushButton("Plot Selected")
         self.plot_selected_button.setToolTip("Plot the currently selected sensor as a four-panel figure.")
         self.plot_selected_button.clicked.connect(self.plot_selected)
@@ -173,6 +186,7 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar())
         self._build_layout()
+        self._set_reference_inputs_enabled(False)
         self.apply_filter()
         self._draw_empty_state()
 
@@ -194,6 +208,9 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.search_edit)
         sidebar_layout.addWidget(self.count_label)
         sidebar_layout.addWidget(self.sensor_list, stretch=1)
+        sidebar_layout.addWidget(self.reference_checkbox)
+        sidebar_layout.addWidget(self.reference_vth_edit)
+        sidebar_layout.addWidget(self.reference_k_edit)
         sidebar_layout.addWidget(self.plot_selected_button)
         sidebar_layout.addWidget(self.plot_filtered_button)
         sidebar_layout.addWidget(self.plot_all_button)
@@ -244,7 +261,20 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not load sensor", str(exc))
             return
 
-        plot_single_device(self.figure, device)
+        try:
+            show_reference, reference_vth, reference_k = self._reference_options()
+            plot_single_device(
+                self.figure,
+                device,
+                show_reference=show_reference,
+                reference_vth=reference_vth,
+                reference_k=reference_k,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Ideal reference parameters", str(exc))
+            self.statusBar().showMessage(str(exc), 8000)
+            return
+
         self._capture_axis_positions()
         self.canvas.draw_idle()
         self.statusBar().showMessage(f"Plotted {sensor.label}", 5000)
@@ -385,6 +415,22 @@ class MainWindow(QMainWindow):
             self.plot_all_button.setEnabled(True)
             self._active_bulk_button = None
             self._active_bulk_default_text = ""
+
+    def _set_reference_inputs_enabled(self, enabled: bool) -> None:
+        self.reference_vth_edit.setEnabled(enabled)
+        self.reference_k_edit.setEnabled(enabled)
+
+    def _reference_options(self) -> tuple[bool, float | None, float | None]:
+        if not self.reference_checkbox.isChecked():
+            return False, None, None
+        vth_text = self.reference_vth_edit.text().strip()
+        k_text = self.reference_k_edit.text().strip()
+        if not vth_text or not k_text:
+            raise ValueError("Enter explicit Vth and k values before enabling the ideal MOSFET reference.")
+        try:
+            return True, float(vth_text), float(k_text)
+        except ValueError as exc:
+            raise ValueError("Vth and k must be numeric values.") from exc
 
     def _draw_empty_state(self) -> None:
         axes = configure_figure(self.figure)
