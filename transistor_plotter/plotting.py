@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Iterable
 
 import numpy as np
@@ -9,6 +8,13 @@ from matplotlib.axes import Axes
 from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 
+from .bias import parse_bias_value
+from .histogram_data import (
+    HISTOGRAM_DIODE_VDS,
+    HISTOGRAM_TRANSFER_VDS,
+    HISTOGRAM_VDS,
+    HISTOGRAM_VGS,
+)
 from .ideal_mosfet import ideal_gate_leakage, ideal_gm, ideal_id, validate_reference_params
 from .models import DeviceCurves
 
@@ -30,10 +36,6 @@ CURVE_COLORS = (
     "#7f7f7f",
     "#bcbd22",
     "#17becf",
-)
-BIAS_RE = re.compile(
-    r"\b(?P<name>VGS|VDS)\s*=\s*(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*V\b",
-    re.IGNORECASE,
 )
 PANEL_SPECS = (
     ("Gate leakage", "Vgs (V)", "Ig (uA/mm)"),
@@ -134,16 +136,57 @@ def finish_overlay_figure(figure: Figure, title: str, count: int) -> None:
     figure.tight_layout()
 
 
+def plot_histograms(
+    figure: Figure,
+    gate_ig: list[float],
+    transfer_id: list[float],
+    output_id: list[float],
+    *,
+    loaded_count: int,
+) -> None:
+    figure.clear()
+    figure.patch.set_facecolor(FIGURE_BG)
+    axes = list(figure.subplots(1, 3))
+    specs = [
+        (
+            gate_ig,
+            f"Ig @ Vgs={HISTOGRAM_VGS:+.1f} V, Vds={HISTOGRAM_DIODE_VDS:+.1f} V",
+            "Ig (uA/mm)",
+            "#ff7f0e",
+        ),
+        (
+            transfer_id,
+            f"Id transfer @ Vgs={HISTOGRAM_VGS:+.1f} V, Vds={HISTOGRAM_TRANSFER_VDS:+.1f} V",
+            "Id (mA/mm)",
+            "#2ca02c",
+        ),
+        (
+            output_id,
+            f"Id output @ Vds={HISTOGRAM_VDS:+.1f} V, Vgs={HISTOGRAM_VGS:+.1f} V",
+            "Id (mA/mm)",
+            "#1f77b4",
+        ),
+    ]
+    for ax, (values, title, xlabel, color) in zip(axes, specs, strict=True):
+        ax.set_facecolor(AXES_BG)
+        ax.grid(True, alpha=0.22, color=GRID_COLOR)
+        ax.tick_params(colors=MUTED_TEXT)
+        for spine in ax.spines.values():
+            spine.set_color("#4b5563")
+        finite_values = np.asarray(values, dtype=float)
+        finite_values = finite_values[np.isfinite(finite_values)]
+        if len(finite_values) > 0:
+            ax.hist(finite_values, bins="auto", color=color, alpha=0.82, edgecolor="#0f172a", linewidth=0.7)
+        ax.set_title(f"{title}\nn={len(finite_values):,}", fontsize=10, fontweight="bold", color=TEXT_COLOR)
+        ax.set_xlabel(xlabel, color=MUTED_TEXT)
+        ax.set_ylabel("Sensor count", color=MUTED_TEXT)
+
+    figure.suptitle(f"Histogram distributions ({loaded_count:,} sensors loaded)", fontsize=13, fontweight="bold", color=TEXT_COLOR)
+    figure.tight_layout()
+
+
 def _curve_color(curve_index: int) -> str:
     return CURVE_COLORS[curve_index % len(CURVE_COLORS)]
-
-
-def parse_bias_value(label: str, bias_name: str) -> float | None:
-    expected = bias_name.upper()
-    for match in BIAS_RE.finditer(label):
-        if match.group("name").upper() == expected:
-            return float(match.group("value"))
-    return None
 
 
 def _add_reference_curves(axes: list[Axes], device: DeviceCurves, vth: float, k: float) -> None:

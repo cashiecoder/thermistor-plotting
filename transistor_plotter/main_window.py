@@ -3,17 +3,21 @@ from __future__ import annotations
 import os
 import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCheckBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -25,20 +29,25 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QSizePolicy,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from .data_loader import discover_sensors, load_device_curves
+from .data_loader import discover_sensors
+from .histogram_data import HistogramSample, extract_histogram_sample
 from .models import DeviceCurves, SensorFiles
+from .mosfet_fitting import FitError, fit_triode_eq_5_16
 from .plotting import (
     TEXT_COLOR,
     add_overlay_devices,
     configure_figure,
     finish_overlay_figure,
+    plot_histograms,
     plot_single_device,
     prepare_overlay_figure,
 )
+from .sqlite_cache import CacheMemoryError, SQLiteCurveCache
 
 # Uses roughly os.cpu_count() / CPU_CORE_DIVISOR loader threads.
 # Set to 4 for about 1/4 of cores or 8 for about 1/8 of cores.
@@ -55,11 +64,13 @@ class LoadAllWorker(QObject):
     def __init__(
         self,
         sensors: list[SensorFiles],
+        loader: Callable[[SensorFiles], DeviceCurves],
         batch_size: int = BULK_BATCH_SIZE,
         cpu_divisor: int = CPU_CORE_DIVISOR,
     ) -> None:
         super().__init__()
         self._sensors = sensors
+        self._loader = loader
         self._batch_size = batch_size
         cpu_count = os.cpu_count() or 1
         self._max_workers = max(1, cpu_count // cpu_divisor)
@@ -87,7 +98,7 @@ class LoadAllWorker(QObject):
             ):
                 sensor = self._sensors[next_sensor_index]
                 next_sensor_index += 1
-                pending[executor.submit(load_device_curves, sensor)] = sensor
+                pending[executor.submit(self._loader, sensor)] = sensor
 
         try:
             submit_until_full()
@@ -115,20 +126,100 @@ class LoadAllWorker(QObject):
             return
         for future in pending:
             future.cancel()
-        executor.shutdown(wait=not self._cancel_requested, cancel_futures=True)
+        executor.shutdown(wait=True, cancel_futures=True)
+        if batch:
+            self.batch_ready.emit(batch)
+        self.finished.emit(loaded, total, self._cancel_requested)
+
+
+class HistogramWorker(QObject):
+    progress = pyqtSignal(int, int)
+    batch_ready = pyqtSignal(list)
+    finished = pyqtSignal(int, int, bool)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        sensors: list[SensorFiles],
+        loader: Callable[[SensorFiles], DeviceCurves],
+        batch_size: int = BULK_BATCH_SIZE,
+        cpu_divisor: int = CPU_CORE_DIVISOR,
+    ) -> None:
+        super().__init__()
+        self._sensors = sensors
+        self._loader = loader
+        self._batch_size = batch_size
+        cpu_count = os.cpu_count() or 1
+        self._max_workers = max(1, cpu_count // cpu_divisor)
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def run(self) -> None:
+        batch: list[HistogramSample] = []
+        loaded = 0
+        total = len(self._sensors)
+        next_sensor_index = 0
+        pending = {}
+        executor = ThreadPoolExecutor(max_workers=self._max_workers)
+
+        def load_sample(sensor: SensorFiles) -> HistogramSample:
+            return extract_histogram_sample(self._loader(sensor))
+
+        def submit_until_full() -> None:
+            nonlocal next_sensor_index
+            target_pending = self._max_workers * 2
+            while (
+                not self._cancel_requested
+                and next_sensor_index < total
+                and len(pending) < target_pending
+            ):
+                sensor = self._sensors[next_sensor_index]
+                next_sensor_index += 1
+                pending[executor.submit(load_sample, sensor)] = sensor
+
+        try:
+            submit_until_full()
+            while pending:
+                if self._cancel_requested:
+                    break
+                done, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    pending.pop(future, None)
+                    batch.append(future.result())
+                    loaded += 1
+                    if len(batch) >= self._batch_size:
+                        self.batch_ready.emit(batch)
+                        batch = []
+                    if loaded == 1 or loaded == total or loaded % 25 == 0:
+                        self.progress.emit(loaded, total)
+                submit_until_full()
+        except Exception as exc:  # noqa: BLE001 - surface data extraction failures in the GUI.
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            self.failed.emit(str(exc))
+            return
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
         if batch:
             self.batch_ready.emit(batch)
         self.finished.emit(loaded, total, self._cancel_requested)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, sensors: list[SensorFiles], curve_cache: SQLiteCurveCache) -> None:
         super().__init__()
         self.setWindowTitle("Transistor Curve Plotter")
         self.resize(1300, 840)
 
         self.data_dir = data_dir
-        self.sensors = discover_sensors(data_dir)
+        self.curve_cache = curve_cache
+        self.sensors = sensors
         self.filtered_sensors = list(self.sensors)
         self._worker_thread: QThread | None = None
         self._worker: LoadAllWorker | None = None
@@ -139,6 +230,24 @@ class MainWindow(QMainWindow):
         self._active_bulk_default_text = ""
         self._focused_axis_index: int | None = None
         self._axis_positions = []
+        self._hist_thread: QThread | None = None
+        self._hist_worker: HistogramWorker | None = None
+        self._hist_started = False
+        self._hist_loaded = 0
+        self._hist_gate_ig: list[float] = []
+        self._hist_transfer_id: list[float] = []
+        self._hist_output_id: list[float] = []
+        self._curve_home_limits: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        self._hist_home_limits: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        self._hover_canvas: FigureCanvas | None = None
+        self._hover_axis_index: int | None = None
+        self._interaction_canvas: FigureCanvas | None = None
+        self._interaction_axis_index: int | None = None
+        self._interaction_mode: str | None = None
+        self._drag_start: tuple[float, float] | None = None
+        self._drag_start_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self._box_patch: Rectangle | None = None
+        self._plot_control_buttons: list[QPushButton] = []
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search device ID or data group")
@@ -151,17 +260,12 @@ class MainWindow(QMainWindow):
 
         self.count_label = QLabel()
 
-        self.reference_checkbox = QCheckBox("Ideal MOSFET reference")
-        self.reference_checkbox.setToolTip("Overlay dashed textbook ideal MOSFET curves using explicit Vth and k.")
-        self.reference_checkbox.toggled.connect(self._set_reference_inputs_enabled)
-
-        self.reference_vth_edit = QLineEdit()
-        self.reference_vth_edit.setPlaceholderText("Vth (V)")
-        self.reference_vth_edit.setToolTip("Threshold voltage in volts. Required only when ideal reference is enabled.")
-
-        self.reference_k_edit = QLineEdit()
-        self.reference_k_edit.setPlaceholderText("k (mA/mm/V^2)")
-        self.reference_k_edit.setToolTip("Positive finite k in mA/mm/V^2. Required only when ideal reference is enabled.")
+        self.reference_checkbox = QCheckBox("Fit ideal MOSFET reference")
+        self.reference_checkbox.setToolTip(
+            "When checked, replot the selected sensor with fitted dashed ideal curves. "
+            "Bulk all/filtered overlays do not use fitted references."
+        )
+        self.reference_checkbox.toggled.connect(self._on_reference_toggled)
 
         self.plot_selected_button = QPushButton("Plot Selected")
         self.plot_selected_button.setToolTip("Plot the currently selected sensor as a four-panel figure.")
@@ -175,6 +279,15 @@ class MainWindow(QMainWindow):
         self.plot_filtered_button.setToolTip("Overlay only the sensors currently visible after the search filter.")
         self.plot_filtered_button.clicked.connect(self.plot_filtered_sensors)
 
+        self.start_hist_button = QPushButton("Start Histograms")
+        self.start_hist_button.setToolTip("Build histogram distributions from all sensors.")
+        self.start_hist_button.clicked.connect(self._start_histograms)
+
+        self.stop_hist_button = QPushButton("Stop Histograms")
+        self.stop_hist_button.setToolTip("Cancel the background histogram build.")
+        self.stop_hist_button.clicked.connect(self._cancel_histograms)
+        self.stop_hist_button.setVisible(False)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
 
@@ -183,12 +296,27 @@ class MainWindow(QMainWindow):
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.toolbar = NavigationToolbar(self.canvas, self)
         self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+        self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+        self.hist_figure = Figure(figsize=(10, 6), constrained_layout=False)
+        self.hist_canvas = FigureCanvas(self.hist_figure)
+        self.hist_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.hist_toolbar = NavigationToolbar(self.hist_canvas, self)
+        self.hist_canvas.mpl_connect("button_press_event", self._on_canvas_press)
+        self.hist_canvas.mpl_connect("button_release_event", self._on_canvas_release)
+        self.hist_canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
+        self.hist_canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+
+        self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.setStatusBar(QStatusBar())
         self._build_layout()
-        self._set_reference_inputs_enabled(False)
         self.apply_filter()
         self._draw_empty_state()
+        self._draw_histogram_idle_state()
 
     def _build_layout(self) -> None:
         root = QWidget()
@@ -209,23 +337,86 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.count_label)
         sidebar_layout.addWidget(self.sensor_list, stretch=1)
         sidebar_layout.addWidget(self.reference_checkbox)
-        sidebar_layout.addWidget(self.reference_vth_edit)
-        sidebar_layout.addWidget(self.reference_k_edit)
         sidebar_layout.addWidget(self.plot_selected_button)
         sidebar_layout.addWidget(self.plot_filtered_button)
         sidebar_layout.addWidget(self.plot_all_button)
+        sidebar_layout.addWidget(self.start_hist_button)
+        sidebar_layout.addWidget(self.stop_hist_button)
         sidebar_layout.addWidget(self.progress_bar)
 
-        plot_area = QWidget()
-        plot_layout = QVBoxLayout(plot_area)
-        plot_layout.setContentsMargins(0, 0, 0, 0)
-        plot_layout.setSpacing(6)
-        plot_layout.addWidget(self.toolbar)
-        plot_layout.addWidget(self.canvas, stretch=1)
+        curve_area = QWidget()
+        curve_layout = QVBoxLayout(curve_area)
+        curve_layout.setContentsMargins(0, 0, 0, 0)
+        curve_layout.setSpacing(6)
+        curve_layout.addWidget(self.toolbar)
+        curve_layout.addWidget(self.canvas, stretch=1)
+        curve_layout.addWidget(
+            self._build_plot_controls(
+                self.canvas,
+                ("Gate leakage", "Output characteristic", "Transfer", "Transconductance"),
+                columns=2,
+            )
+        )
+
+        histogram_area = QWidget()
+        histogram_layout = QVBoxLayout(histogram_area)
+        histogram_layout.setContentsMargins(0, 0, 0, 0)
+        histogram_layout.setSpacing(6)
+        histogram_layout.addWidget(self.hist_toolbar)
+        histogram_layout.addWidget(self.hist_canvas, stretch=1)
+        histogram_layout.addWidget(
+            self._build_plot_controls(
+                self.hist_canvas,
+                ("Gate Ig", "Transfer Id", "Output Id"),
+                columns=3,
+            )
+        )
+
+        self.tabs.addTab(curve_area, "Curves")
+        self.tabs.addTab(histogram_area, "Histograms")
 
         main_layout.addWidget(sidebar)
-        main_layout.addWidget(plot_area, stretch=1)
+        main_layout.addWidget(self.tabs, stretch=1)
         self.setCentralWidget(root)
+
+    def _build_plot_controls(self, canvas: FigureCanvas, labels: tuple[str, ...], columns: int) -> QWidget:
+        container = QWidget()
+        grid = QGridLayout(container)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        for axis_index, label_text in enumerate(labels):
+            cell = QWidget()
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(4)
+
+            label = QLabel(label_text)
+            label.setObjectName("plotControlLabel")
+            cell_layout.addWidget(label)
+
+            box_button = QPushButton("Box")
+            box_button.setToolTip(f"Drag a zoom box on {label_text}.")
+            box_button.clicked.connect(partial(self._set_plot_interaction, canvas, axis_index, "box"))
+            cell_layout.addWidget(box_button)
+            self._plot_control_buttons.append(box_button)
+
+            pan_button = QPushButton("Pan")
+            pan_button.setToolTip(f"Drag {label_text} to pan.")
+            pan_button.clicked.connect(partial(self._set_plot_interaction, canvas, axis_index, "pan"))
+            cell_layout.addWidget(pan_button)
+            self._plot_control_buttons.append(pan_button)
+
+            reset_button = QPushButton("Reset")
+            reset_button.setToolTip(f"Reset zoom for {label_text}.")
+            reset_button.clicked.connect(partial(self._reset_axis_zoom, canvas, axis_index))
+            cell_layout.addWidget(reset_button)
+            self._plot_control_buttons.append(reset_button)
+
+            row, column = divmod(axis_index, columns)
+            grid.addWidget(cell, row, column)
+        return container
 
     def apply_filter(self) -> None:
         query = self.search_edit.text().strip().lower()
@@ -249,35 +440,72 @@ class MainWindow(QMainWindow):
         if self._worker_thread is not None:
             self.statusBar().showMessage("Cancel the background overlay before plotting a selected sensor.", 5000)
             return
-        item = self.sensor_list.currentItem()
-        if item is None:
-            self.statusBar().showMessage("Choose a sensor first.", 4000)
+        if self._hist_thread is not None:
+            self.statusBar().showMessage("Stop or finish histogram building before plotting a selected sensor.", 5000)
             return
-
-        sensor = item.data(Qt.ItemDataRole.UserRole)
         try:
-            device = load_device_curves(sensor)
+            sensor, device = self._load_selected_device()
+            result = fit_triode_eq_5_16(device) if self.reference_checkbox.isChecked() else None
+            self._plot_device(sensor, device, fit_result=result)
+        except LookupError as exc:
+            self.statusBar().showMessage(str(exc), 5000)
+            return
+        except FitError as exc:
+            QMessageBox.warning(self, "Could not fit ideal reference", str(exc))
+            self.statusBar().showMessage(str(exc), 8000)
+            return
         except Exception as exc:  # noqa: BLE001 - present spreadsheet read errors in the GUI.
             QMessageBox.critical(self, "Could not load sensor", str(exc))
             return
 
-        try:
-            show_reference, reference_vth, reference_k = self._reference_options()
-            plot_single_device(
-                self.figure,
-                device,
-                show_reference=show_reference,
-                reference_vth=reference_vth,
-                reference_k=reference_k,
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "Ideal reference parameters", str(exc))
-            self.statusBar().showMessage(str(exc), 8000)
+    def _on_reference_toggled(self, checked: bool) -> None:
+        if self._worker_thread is not None:
+            self.statusBar().showMessage("Cancel the background overlay before changing the fitted reference.", 5000)
             return
+        if self.sensor_list.currentItem() is None:
+            return
+        self.statusBar().showMessage("Fitting and plotting selected sensor..." if checked else "Plotting selected sensor...")
+        self.plot_selected()
 
+    def _load_selected_device(self) -> tuple[SensorFiles, DeviceCurves]:
+        item = self.sensor_list.currentItem()
+        if item is None:
+            raise LookupError("Choose a sensor first.")
+        sensor = item.data(Qt.ItemDataRole.UserRole)
+        return sensor, self._load_device_curves(sensor)
+
+    def _load_device_curves(self, sensor: SensorFiles) -> DeviceCurves:
+        return self.curve_cache.load_device_curves(sensor)
+
+    def _plot_device(
+        self,
+        sensor: SensorFiles,
+        device: DeviceCurves,
+        *,
+        fit_result,
+    ) -> None:
+        self._clear_plot_interaction()
+        plot_single_device(
+            self.figure,
+            device,
+            show_reference=fit_result is not None,
+            reference_vth=fit_result.vth if fit_result is not None else None,
+            reference_k=fit_result.k if fit_result is not None else None,
+        )
         self._capture_axis_positions()
+        self._remember_home_limits(self.canvas)
         self.canvas.draw_idle()
-        self.statusBar().showMessage(f"Plotted {sensor.label}", 5000)
+        if fit_result is None:
+            self.statusBar().showMessage(f"Plotted {sensor.label}", 5000)
+        else:
+            self.statusBar().showMessage(
+                (
+                    f"{fit_result.method}: Vth={fit_result.vth:.4g} V, "
+                    f"k={fit_result.k:.4g} mA/mm/V^2, points={fit_result.points_used}, "
+                    f"RMS={fit_result.rms_error:.4g} mA/mm"
+                ),
+                12000,
+            )
 
     def plot_filtered_sensors(self) -> None:
         if self._handle_active_bulk_button(self.plot_filtered_button):
@@ -306,13 +534,18 @@ class MainWindow(QMainWindow):
         if self._worker_thread is not None:
             self.statusBar().showMessage("A plot job is already running.", 4000)
             return
+        if self._hist_thread is not None:
+            self.statusBar().showMessage("Wait for histogram building to finish before starting a bulk overlay.", 5000)
+            return
 
+        self._clear_plot_interaction()
         self._set_bulk_busy(True, cancel_button)
         self._focused_axis_index = None
         self._bulk_title = title
         self._bulk_plotted = 0
         self._bulk_axes = prepare_overlay_figure(self.figure, title)
         self._capture_axis_positions()
+        self._remember_home_limits(self.canvas)
         self.canvas.draw_idle()
         self.progress_bar.setMaximum(len(sensors))
         self.progress_bar.setValue(0)
@@ -320,7 +553,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Loading {len(sensors):,} {label} with {worker_count} worker threads...")
 
         self._worker_thread = QThread(self)
-        self._worker = LoadAllWorker(sensors)
+        self._worker = LoadAllWorker(sensors, self._load_device_curves)
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_worker_progress)
@@ -365,6 +598,7 @@ class MainWindow(QMainWindow):
             fontweight="bold",
             color=TEXT_COLOR,
         )
+        self._remember_home_limits(self.canvas)
         self.canvas.draw_idle()
 
     def _on_worker_finished(self, loaded: int, total: int, cancelled: bool) -> None:
@@ -379,6 +613,7 @@ class MainWindow(QMainWindow):
                     fontweight="bold",
                     color=TEXT_COLOR,
                 )
+            self._remember_home_limits(self.canvas)
             self.canvas.draw_idle()
         if cancelled:
             self.statusBar().showMessage(f"Cancelled after loading {loaded:,} of {total:,} sensors.", 8000)
@@ -398,9 +633,170 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._worker_thread = None
 
+    def _on_tab_changed(self, index: int) -> None:
+        if self.tabs.tabText(index) == "Histograms":
+            self.statusBar().showMessage("Click Start Histograms to build histogram distributions.", 5000)
+
+    def _set_plot_interaction(self, canvas: FigureCanvas, axis_index: int, mode: str) -> None:
+        if (
+            self._interaction_canvas is canvas
+            and self._interaction_axis_index == axis_index
+            and self._interaction_mode == mode
+        ):
+            self._clear_plot_interaction()
+            return
+        self._clear_plot_interaction()
+        self._interaction_canvas = canvas
+        self._interaction_axis_index = axis_index
+        self._interaction_mode = mode
+        self.statusBar().showMessage(
+            f"{mode.title()} mode armed for one plot. Drag inside that plot to use it.",
+            6000,
+        )
+
+    def _clear_plot_interaction(self) -> None:
+        self._remove_box_patch()
+        self._interaction_canvas = None
+        self._interaction_axis_index = None
+        self._interaction_mode = None
+        self._drag_start = None
+        self._drag_start_limits = None
+
+    def _reset_axis_zoom(self, canvas: FigureCanvas, axis_index: int) -> None:
+        home_limits = self._home_limits_for_canvas(canvas)
+        if axis_index >= len(canvas.figure.axes) or axis_index >= len(home_limits):
+            return
+        x_limits, y_limits = home_limits[axis_index]
+        axis = canvas.figure.axes[axis_index]
+        axis.set_xlim(x_limits)
+        axis.set_ylim(y_limits)
+        canvas.draw_idle()
+        self.statusBar().showMessage("Reset zoom for one plot.", 4000)
+
+    def _start_histograms(self) -> None:
+        if self._hist_thread is not None:
+            return
+        if self._worker_thread is not None:
+            self.statusBar().showMessage("Cancel the current bulk overlay before building histograms.", 5000)
+            return
+        self._clear_plot_interaction()
+        self._hist_started = True
+        self._hist_loaded = 0
+        self._hist_gate_ig.clear()
+        self._hist_transfer_id.clear()
+        self._hist_output_id.clear()
+        plot_histograms(
+            self.hist_figure,
+            self._hist_gate_ig,
+            self._hist_transfer_id,
+            self._hist_output_id,
+            loaded_count=0,
+        )
+        self._remember_home_limits(self.hist_canvas)
+        self.hist_canvas.draw_idle()
+
+        self._hist_thread = QThread(self)
+        self._hist_worker = HistogramWorker(self.sensors, self._load_device_curves)
+        self._hist_worker.moveToThread(self._hist_thread)
+        self._hist_thread.started.connect(self._hist_worker.run)
+        self._hist_worker.progress.connect(self._on_hist_progress)
+        self._hist_worker.batch_ready.connect(self._on_hist_batch_ready)
+        self._hist_worker.finished.connect(self._on_hist_finished)
+        self._hist_worker.failed.connect(self._on_hist_failed)
+        self._hist_worker.finished.connect(self._hist_thread.quit)
+        self._hist_worker.failed.connect(self._hist_thread.quit)
+        self._hist_thread.finished.connect(self._cleanup_hist_worker)
+        self._hist_thread.start()
+        self.start_hist_button.setVisible(False)
+        self.stop_hist_button.setText("Stop Histograms")
+        self.stop_hist_button.setEnabled(True)
+        self.stop_hist_button.setVisible(True)
+        self.statusBar().showMessage("Building histograms from all sensors...")
+
+    def _cancel_histograms(self) -> None:
+        if self._hist_worker is None:
+            return
+        self._hist_worker.cancel()
+        self.stop_hist_button.setText("Stopping...")
+        self.stop_hist_button.setEnabled(False)
+        self.statusBar().showMessage("Stopping histogram build...")
+
+    def _on_hist_progress(self, done: int, total: int) -> None:
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(done)
+        self.statusBar().showMessage(f"Built histogram samples for {done:,} of {total:,} sensors...")
+
+    def _on_hist_batch_ready(self, samples: list[HistogramSample]) -> None:
+        for sample in samples:
+            self._hist_loaded += 1
+            if sample.gate_ig is not None:
+                self._hist_gate_ig.append(sample.gate_ig)
+            if sample.transfer_id is not None:
+                self._hist_transfer_id.append(sample.transfer_id)
+            if sample.output_id is not None:
+                self._hist_output_id.append(sample.output_id)
+        plot_histograms(
+            self.hist_figure,
+            self._hist_gate_ig,
+            self._hist_transfer_id,
+            self._hist_output_id,
+            loaded_count=self._hist_loaded,
+        )
+        self._remember_home_limits(self.hist_canvas)
+        self.hist_canvas.draw_idle()
+
+    def _on_hist_finished(self, loaded: int, total: int, cancelled: bool) -> None:
+        self.progress_bar.setVisible(False)
+        plot_histograms(
+            self.hist_figure,
+            self._hist_gate_ig,
+            self._hist_transfer_id,
+            self._hist_output_id,
+            loaded_count=self._hist_loaded,
+        )
+        self._remember_home_limits(self.hist_canvas)
+        self.hist_canvas.draw_idle()
+        if cancelled:
+            self._hist_started = False
+            self.start_hist_button.setText("Start Histograms")
+            self.statusBar().showMessage(f"Histogram build cancelled after {loaded:,} of {total:,} sensors.", 8000)
+        else:
+            self.start_hist_button.setText("Rebuild Histograms")
+            self.statusBar().showMessage(f"Built histograms from {loaded:,} sensors.", 8000)
+        self.start_hist_button.setEnabled(True)
+        self.start_hist_button.setVisible(True)
+        self.stop_hist_button.setVisible(False)
+
+    def _on_hist_failed(self, message: str) -> None:
+        self.progress_bar.setVisible(False)
+        self._hist_started = False
+        self.start_hist_button.setText("Start Histograms")
+        self.start_hist_button.setEnabled(True)
+        self.start_hist_button.setVisible(True)
+        self.stop_hist_button.setVisible(False)
+        QMessageBox.critical(self, "Could not build histograms", message)
+
+    def _cleanup_hist_worker(self) -> None:
+        if self._hist_worker is not None:
+            self._hist_worker.deleteLater()
+        if self._hist_thread is not None:
+            self._hist_thread.deleteLater()
+        self._hist_worker = None
+        self._hist_thread = None
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001 - Qt event type.
+        if self._worker is not None:
+            self._worker.cancel()
+        if self._hist_worker is not None:
+            self._hist_worker.cancel()
+        super().closeEvent(event)
+
     def _set_bulk_busy(self, busy: bool, cancel_button: QPushButton | None = None) -> None:
         self.progress_bar.setVisible(busy)
         self.plot_selected_button.setEnabled(not busy)
+        self.reference_checkbox.setEnabled(not busy)
+        self.start_hist_button.setEnabled(not busy)
         if busy:
             self._active_bulk_button = cancel_button
             self._active_bulk_default_text = cancel_button.text() if cancel_button is not None else ""
@@ -415,22 +811,6 @@ class MainWindow(QMainWindow):
             self.plot_all_button.setEnabled(True)
             self._active_bulk_button = None
             self._active_bulk_default_text = ""
-
-    def _set_reference_inputs_enabled(self, enabled: bool) -> None:
-        self.reference_vth_edit.setEnabled(enabled)
-        self.reference_k_edit.setEnabled(enabled)
-
-    def _reference_options(self) -> tuple[bool, float | None, float | None]:
-        if not self.reference_checkbox.isChecked():
-            return False, None, None
-        vth_text = self.reference_vth_edit.text().strip()
-        k_text = self.reference_k_edit.text().strip()
-        if not vth_text or not k_text:
-            raise ValueError("Enter explicit Vth and k values before enabling the ideal MOSFET reference.")
-        try:
-            return True, float(vth_text), float(k_text)
-        except ValueError as exc:
-            raise ValueError("Vth and k must be numeric values.") from exc
 
     def _draw_empty_state(self) -> None:
         axes = configure_figure(self.figure)
@@ -449,7 +829,173 @@ class MainWindow(QMainWindow):
         )
         self.figure.tight_layout()
         self._capture_axis_positions()
+        self._remember_home_limits(self.canvas)
         self.canvas.draw_idle()
+
+    def _draw_histogram_idle_state(self) -> None:
+        self.hist_figure.clear()
+        self.hist_figure.patch.set_facecolor("#111827")
+        ax = self.hist_figure.add_subplot(111)
+        ax.set_facecolor("#172033")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_color("#4b5563")
+        ax.text(
+            0.5,
+            0.5,
+            "Click Start Histograms",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+            color=TEXT_COLOR,
+        )
+        self.hist_figure.tight_layout()
+        self._remember_home_limits(self.hist_canvas)
+        self.hist_canvas.draw_idle()
+
+    def _on_mouse_move(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        self._hover_canvas = event.canvas
+        if event.inaxes is None:
+            self._hover_axis_index = None
+        else:
+            try:
+                self._hover_axis_index = event.canvas.figure.axes.index(event.inaxes)
+            except ValueError:
+                self._hover_axis_index = None
+        self._update_custom_drag(event)
+
+    def _on_canvas_press(self, event) -> bool:  # noqa: ANN001 - matplotlib event object.
+        if event.button != 1:
+            return False
+        if event.canvas is not self._interaction_canvas:
+            return False
+        if self._interaction_axis_index is None or self._interaction_mode is None:
+            return False
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return False
+        if self._interaction_axis_index >= len(event.canvas.figure.axes):
+            return False
+        if event.inaxes is not event.canvas.figure.axes[self._interaction_axis_index]:
+            return False
+
+        self._drag_start = (event.xdata, event.ydata)
+        self._drag_start_limits = (event.inaxes.get_xlim(), event.inaxes.get_ylim())
+        if self._interaction_mode == "box":
+            self._box_patch = Rectangle(
+                (event.xdata, event.ydata),
+                0.0,
+                0.0,
+                fill=False,
+                edgecolor="#e5e7eb",
+                linewidth=1.2,
+                linestyle="--",
+            )
+            event.inaxes.add_patch(self._box_patch)
+            event.canvas.draw_idle()
+        return True
+
+    def _on_canvas_release(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._drag_start is None or self._interaction_mode is None:
+            return
+        if event.canvas is not self._interaction_canvas:
+            return
+        if self._interaction_axis_index is None or self._interaction_axis_index >= len(event.canvas.figure.axes):
+            self._clear_plot_interaction()
+            return
+
+        axis = event.canvas.figure.axes[self._interaction_axis_index]
+        if self._interaction_mode == "box" and event.inaxes is axis and event.xdata is not None and event.ydata is not None:
+            x0, y0 = self._drag_start
+            x1, y1 = event.xdata, event.ydata
+            if abs(x1 - x0) > 1e-12 and abs(y1 - y0) > 1e-12:
+                axis.set_xlim(min(x0, x1), max(x0, x1))
+                axis.set_ylim(min(y0, y1), max(y0, y1))
+
+        self._remove_box_patch()
+        self._drag_start = None
+        self._drag_start_limits = None
+        event.canvas.draw_idle()
+
+    def _update_custom_drag(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._drag_start is None or self._interaction_mode is None:
+            return
+        if event.canvas is not self._interaction_canvas:
+            return
+        if self._interaction_axis_index is None or self._interaction_axis_index >= len(event.canvas.figure.axes):
+            return
+        if event.inaxes is not event.canvas.figure.axes[self._interaction_axis_index]:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        axis = event.canvas.figure.axes[self._interaction_axis_index]
+        x0, y0 = self._drag_start
+        if self._interaction_mode == "box" and self._box_patch is not None:
+            self._box_patch.set_xy((min(x0, event.xdata), min(y0, event.ydata)))
+            self._box_patch.set_width(abs(event.xdata - x0))
+            self._box_patch.set_height(abs(event.ydata - y0))
+            event.canvas.draw_idle()
+        elif self._interaction_mode == "pan" and self._drag_start_limits is not None:
+            (x_min, x_max), (y_min, y_max) = self._drag_start_limits
+            dx = event.xdata - x0
+            dy = event.ydata - y0
+            axis.set_xlim(x_min - dx, x_max - dx)
+            axis.set_ylim(y_min - dy, y_max - dy)
+            event.canvas.draw_idle()
+
+    def _remove_box_patch(self) -> None:
+        if self._box_patch is not None:
+            try:
+                self._box_patch.remove()
+            except ValueError:
+                pass
+            self._box_patch = None
+
+    def _on_scroll_zoom(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        toolbar = self._toolbar_for_canvas(event.canvas)
+        if toolbar is not None and getattr(toolbar, "mode", ""):
+            return
+
+        scale = 0.82 if event.button == "up" else 1.22
+        self._zoom_axis(event.inaxes, event.xdata, event.ydata, scale)
+        event.canvas.draw_idle()
+
+    def _toolbar_for_canvas(self, canvas) -> NavigationToolbar | None:  # noqa: ANN001 - matplotlib canvas object.
+        if canvas is self.canvas:
+            return self.toolbar
+        if canvas is self.hist_canvas:
+            return self.hist_toolbar
+        return None
+
+    def _home_limits_for_canvas(self, canvas) -> list[tuple[tuple[float, float], tuple[float, float]]]:  # noqa: ANN001
+        if canvas is self.canvas:
+            return self._curve_home_limits
+        if canvas is self.hist_canvas:
+            return self._hist_home_limits
+        return []
+
+    def _remember_home_limits(self, canvas) -> None:  # noqa: ANN001 - matplotlib canvas object.
+        limits = [(axis.get_xlim(), axis.get_ylim()) for axis in canvas.figure.axes]
+        if canvas is self.canvas:
+            self._curve_home_limits = limits
+        elif canvas is self.hist_canvas:
+            self._hist_home_limits = limits
+
+    def _zoom_axis(self, axis, x_center: float, y_center: float, scale: float) -> None:  # noqa: ANN001 - matplotlib axis.
+        x_min, x_max = axis.get_xlim()
+        y_min, y_max = axis.get_ylim()
+        new_width = (x_max - x_min) * scale
+        new_height = (y_max - y_min) * scale
+
+        x_rel = (x_center - x_min) / (x_max - x_min) if x_max != x_min else 0.5
+        y_rel = (y_center - y_min) / (y_max - y_min) if y_max != y_min else 0.5
+
+        axis.set_xlim(x_center - new_width * x_rel, x_center + new_width * (1.0 - x_rel))
+        axis.set_ylim(y_center - new_height * y_rel, y_center + new_height * (1.0 - y_rel))
 
     def _capture_axis_positions(self) -> None:
         if self._focused_axis_index is not None:
@@ -457,7 +1003,11 @@ class MainWindow(QMainWindow):
         self._axis_positions = [axis.get_position().frozen() for axis in self.figure.axes]
 
     def _on_canvas_click(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._on_canvas_press(event):
+            return
         if getattr(self.toolbar, "mode", ""):
+            return
+        if self._interaction_canvas is self.canvas and self._interaction_mode is not None:
             return
         if not self.figure.axes:
             return
@@ -520,6 +1070,11 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #f8fafc;
             font-size: 18px;
             font-weight: 700;
+        }
+        QLabel#plotControlLabel {
+            color: #cbd5e1;
+            font-weight: 600;
+            min-width: 118px;
         }
         QListWidget {
             background: #172033;
@@ -593,6 +1148,28 @@ def apply_dark_theme(app: QApplication) -> None:
         QToolButton:hover {
             background: #2f3d57;
         }
+        QTabWidget::pane {
+            border: 1px solid #334155;
+            border-radius: 4px;
+            top: -1px;
+        }
+        QTabBar::tab {
+            color: #cbd5e1;
+            background: #172033;
+            border: 1px solid #334155;
+            padding: 8px 14px;
+            margin-right: 2px;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }
+        QTabBar::tab:selected {
+            color: #ffffff;
+            background: #243047;
+            border-bottom-color: #243047;
+        }
+        QTabBar::tab:hover {
+            background: #2f3d57;
+        }
         QMessageBox {
             background: #111827;
         }
@@ -607,6 +1184,17 @@ def main() -> int:
     app = QApplication(sys.argv)
     apply_dark_theme(app)
 
-    window = MainWindow(data_dir)
+    sensors = discover_sensors(data_dir)
+    cache_path = project_root / "cache" / "transistor_data.sqlite3"
+    try:
+        curve_cache = SQLiteCurveCache.open(cache_path, data_dir, sensors)
+    except CacheMemoryError as exc:
+        QMessageBox.critical(None, "Not enough memory", str(exc))
+        return 1
+    except Exception as exc:  # noqa: BLE001 - cache preparation failures need to be visible.
+        QMessageBox.critical(None, "Could not prepare SQLite cache", str(exc))
+        return 1
+
+    window = MainWindow(data_dir, sensors, curve_cache)
     window.show()
     return app.exec()
