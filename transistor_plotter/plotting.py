@@ -85,7 +85,7 @@ def plot_single_device(
         _finish_axis(ax, panel.title, panel.xlabel, panel.ylabel, show_legend=True)
 
     figure.suptitle(device.sensor.label, fontsize=13, fontweight="bold", color=TEXT_COLOR)
-    figure.tight_layout()
+    figure.tight_layout(pad=1.35)
 
 
 def plot_all_devices(figure: Figure, devices: Iterable[DeviceCurves]) -> int:
@@ -100,7 +100,7 @@ def prepare_overlay_figure(figure: Figure, title: str) -> list[Axes]:
     for ax, (panel_title, xlabel, ylabel) in zip(axes, PANEL_SPECS, strict=True):
         _finish_axis(ax, panel_title, xlabel, ylabel, show_legend=False)
     figure.suptitle(f"{title} (loading...)", fontsize=13, fontweight="bold", color=TEXT_COLOR)
-    figure.tight_layout()
+    figure.tight_layout(pad=1.35)
     return axes
 
 
@@ -133,7 +133,7 @@ def add_overlay_devices(axes: list[Axes], devices: Iterable[DeviceCurves]) -> in
 
 def finish_overlay_figure(figure: Figure, title: str, count: int) -> None:
     figure.suptitle(f"{title} ({count} devices)", fontsize=13, fontweight="bold", color=TEXT_COLOR)
-    figure.tight_layout()
+    figure.tight_layout(pad=1.35)
 
 
 def plot_histograms(
@@ -182,7 +182,7 @@ def plot_histograms(
         ax.set_ylabel("Sensor count", color=MUTED_TEXT)
 
     figure.suptitle(f"Histogram distributions ({loaded_count:,} sensors loaded)", fontsize=13, fontweight="bold", color=TEXT_COLOR)
-    figure.tight_layout()
+    figure.tight_layout(pad=1.35)
 
 
 def _curve_color(curve_index: int) -> str:

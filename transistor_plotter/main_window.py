@@ -347,8 +347,8 @@ class MainWindow(QMainWindow):
 
         curve_area = QWidget()
         curve_layout = QVBoxLayout(curve_area)
-        curve_layout.setContentsMargins(0, 0, 0, 0)
-        curve_layout.setSpacing(6)
+        curve_layout.setContentsMargins(10, 8, 10, 10)
+        curve_layout.setSpacing(8)
         curve_layout.addWidget(self.toolbar)
         curve_layout.addWidget(self.canvas, stretch=1)
         curve_layout.addWidget(
@@ -361,8 +361,8 @@ class MainWindow(QMainWindow):
 
         histogram_area = QWidget()
         histogram_layout = QVBoxLayout(histogram_area)
-        histogram_layout.setContentsMargins(0, 0, 0, 0)
-        histogram_layout.setSpacing(6)
+        histogram_layout.setContentsMargins(10, 8, 10, 10)
+        histogram_layout.setSpacing(8)
         histogram_layout.addWidget(self.hist_toolbar)
         histogram_layout.addWidget(self.hist_canvas, stretch=1)
         histogram_layout.addWidget(
@@ -383,7 +383,7 @@ class MainWindow(QMainWindow):
     def _build_plot_controls(self, canvas: FigureCanvas, labels: tuple[str, ...], columns: int) -> QWidget:
         container = QWidget()
         grid = QGridLayout(container)
-        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setContentsMargins(8, 2, 8, 2)
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(6)
 
@@ -839,7 +839,7 @@ class MainWindow(QMainWindow):
             fontsize=12,
             color=TEXT_COLOR,
         )
-        self.figure.tight_layout()
+        self.figure.tight_layout(pad=1.35)
         self._capture_axis_positions()
         self._remember_home_limits(self.canvas)
         self.canvas.draw_idle()
@@ -863,7 +863,7 @@ class MainWindow(QMainWindow):
             fontsize=12,
             color=TEXT_COLOR,
         )
-        self.hist_figure.tight_layout()
+        self.hist_figure.tight_layout(pad=1.35)
         self._remember_home_limits(self.hist_canvas)
         self.hist_canvas.draw_idle()
 
