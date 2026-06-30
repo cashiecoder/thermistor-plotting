@@ -10,8 +10,7 @@ from pathlib import Path
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib.patches import Rectangle
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
@@ -27,6 +26,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QRubberBand,
     QSizePolicy,
     QStatusBar,
     QTabWidget,
@@ -246,7 +246,8 @@ class MainWindow(QMainWindow):
         self._interaction_mode: str | None = None
         self._drag_start: tuple[float, float] | None = None
         self._drag_start_limits: tuple[tuple[float, float], tuple[float, float]] | None = None
-        self._box_patch: Rectangle | None = None
+        self._rubber_band: QRubberBand | None = None
+        self._rubber_band_origin: QPoint | None = None
         self._plot_control_buttons: list[QPushButton] = []
 
         self.search_edit = QLineEdit()
@@ -638,6 +639,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Click Start Histograms to build histogram distributions.", 5000)
 
     def _set_plot_interaction(self, canvas: FigureCanvas, axis_index: int, mode: str) -> None:
+        if self._plotting_busy():
+            self.statusBar().showMessage("Zoom controls are disabled while plotting or building histograms.", 5000)
+            return
         if (
             self._interaction_canvas is canvas
             and self._interaction_axis_index == axis_index
@@ -655,7 +659,7 @@ class MainWindow(QMainWindow):
         )
 
     def _clear_plot_interaction(self) -> None:
-        self._remove_box_patch()
+        self._hide_rubber_band()
         self._interaction_canvas = None
         self._interaction_axis_index = None
         self._interaction_mode = None
@@ -663,6 +667,9 @@ class MainWindow(QMainWindow):
         self._drag_start_limits = None
 
     def _reset_axis_zoom(self, canvas: FigureCanvas, axis_index: int) -> None:
+        if self._plotting_busy():
+            self.statusBar().showMessage("Zoom controls are disabled while plotting or building histograms.", 5000)
+            return
         home_limits = self._home_limits_for_canvas(canvas)
         if axis_index >= len(canvas.figure.axes) or axis_index >= len(home_limits):
             return
@@ -680,6 +687,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Cancel the current bulk overlay before building histograms.", 5000)
             return
         self._clear_plot_interaction()
+        self._set_plot_controls_enabled(False)
         self._hist_started = True
         self._hist_loaded = 0
         self._hist_gate_ig.clear()
@@ -764,6 +772,7 @@ class MainWindow(QMainWindow):
         else:
             self.start_hist_button.setText("Rebuild Histograms")
             self.statusBar().showMessage(f"Built histograms from {loaded:,} sensors.", 8000)
+        self._set_plot_controls_enabled(True)
         self.start_hist_button.setEnabled(True)
         self.start_hist_button.setVisible(True)
         self.stop_hist_button.setVisible(False)
@@ -771,6 +780,7 @@ class MainWindow(QMainWindow):
     def _on_hist_failed(self, message: str) -> None:
         self.progress_bar.setVisible(False)
         self._hist_started = False
+        self._set_plot_controls_enabled(True)
         self.start_hist_button.setText("Start Histograms")
         self.start_hist_button.setEnabled(True)
         self.start_hist_button.setVisible(True)
@@ -797,7 +807,9 @@ class MainWindow(QMainWindow):
         self.plot_selected_button.setEnabled(not busy)
         self.reference_checkbox.setEnabled(not busy)
         self.start_hist_button.setEnabled(not busy)
+        self._set_plot_controls_enabled(not busy)
         if busy:
+            self._clear_plot_interaction()
             self._active_bulk_button = cancel_button
             self._active_bulk_default_text = cancel_button.text() if cancel_button is not None else ""
             self.plot_filtered_button.setEnabled(cancel_button is self.plot_filtered_button)
@@ -856,6 +868,8 @@ class MainWindow(QMainWindow):
         self.hist_canvas.draw_idle()
 
     def _on_mouse_move(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._plotting_busy():
+            return
         self._hover_canvas = event.canvas
         if event.inaxes is None:
             self._hover_axis_index = None
@@ -867,6 +881,8 @@ class MainWindow(QMainWindow):
         self._update_custom_drag(event)
 
     def _on_canvas_press(self, event) -> bool:  # noqa: ANN001 - matplotlib event object.
+        if self._plotting_busy():
+            return False
         if event.button != 1:
             return False
         if event.canvas is not self._interaction_canvas:
@@ -883,20 +899,13 @@ class MainWindow(QMainWindow):
         self._drag_start = (event.xdata, event.ydata)
         self._drag_start_limits = (event.inaxes.get_xlim(), event.inaxes.get_ylim())
         if self._interaction_mode == "box":
-            self._box_patch = Rectangle(
-                (event.xdata, event.ydata),
-                0.0,
-                0.0,
-                fill=False,
-                edgecolor="#e5e7eb",
-                linewidth=1.2,
-                linestyle="--",
-            )
-            event.inaxes.add_patch(self._box_patch)
-            event.canvas.draw_idle()
+            self._start_rubber_band(event)
         return True
 
     def _on_canvas_release(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._plotting_busy():
+            self._clear_plot_interaction()
+            return
         if self._drag_start is None or self._interaction_mode is None:
             return
         if event.canvas is not self._interaction_canvas:
@@ -906,38 +915,42 @@ class MainWindow(QMainWindow):
             return
 
         axis = event.canvas.figure.axes[self._interaction_axis_index]
-        if self._interaction_mode == "box" and event.inaxes is axis and event.xdata is not None and event.ydata is not None:
+        should_redraw = False
+        if self._interaction_mode == "box":
             x0, y0 = self._drag_start
-            x1, y1 = event.xdata, event.ydata
+            x1, y1 = self._event_data_point(event, axis)
             if abs(x1 - x0) > 1e-12 and abs(y1 - y0) > 1e-12:
                 axis.set_xlim(min(x0, x1), max(x0, x1))
                 axis.set_ylim(min(y0, y1), max(y0, y1))
+                should_redraw = True
 
-        self._remove_box_patch()
+        self._hide_rubber_band()
         self._drag_start = None
         self._drag_start_limits = None
-        event.canvas.draw_idle()
+        if should_redraw:
+            event.canvas.draw_idle()
 
     def _update_custom_drag(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._plotting_busy():
+            return
         if self._drag_start is None or self._interaction_mode is None:
             return
         if event.canvas is not self._interaction_canvas:
             return
         if self._interaction_axis_index is None or self._interaction_axis_index >= len(event.canvas.figure.axes):
             return
-        if event.inaxes is not event.canvas.figure.axes[self._interaction_axis_index]:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
 
-        axis = event.canvas.figure.axes[self._interaction_axis_index]
         x0, y0 = self._drag_start
-        if self._interaction_mode == "box" and self._box_patch is not None:
-            self._box_patch.set_xy((min(x0, event.xdata), min(y0, event.ydata)))
-            self._box_patch.set_width(abs(event.xdata - x0))
-            self._box_patch.set_height(abs(event.ydata - y0))
-            event.canvas.draw_idle()
-        elif self._interaction_mode == "pan" and self._drag_start_limits is not None:
+        if self._interaction_mode == "box":
+            self._update_rubber_band(event)
+        elif (
+            self._interaction_mode == "pan"
+            and self._drag_start_limits is not None
+            and event.inaxes is event.canvas.figure.axes[self._interaction_axis_index]
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
+            axis = event.canvas.figure.axes[self._interaction_axis_index]
             (x_min, x_max), (y_min, y_max) = self._drag_start_limits
             dx = event.xdata - x0
             dy = event.ydata - y0
@@ -945,15 +958,54 @@ class MainWindow(QMainWindow):
             axis.set_ylim(y_min - dy, y_max - dy)
             event.canvas.draw_idle()
 
-    def _remove_box_patch(self) -> None:
-        if self._box_patch is not None:
-            try:
-                self._box_patch.remove()
-            except ValueError:
-                pass
-            self._box_patch = None
+    def _start_rubber_band(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        origin = self._event_qpoint(event)
+        self._rubber_band_origin = origin
+        self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, event.canvas)
+        self._rubber_band.setGeometry(QRect(origin, origin))
+        self._rubber_band.show()
+
+    def _update_rubber_band(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._rubber_band is None or self._rubber_band_origin is None:
+            return
+        axis = self._interaction_axis(event)
+        if axis is None:
+            return
+        self._rubber_band.setGeometry(QRect(self._rubber_band_origin, self._event_qpoint(event, axis)).normalized())
+
+    def _hide_rubber_band(self) -> None:
+        if self._rubber_band is not None:
+            self._rubber_band.hide()
+            self._rubber_band.deleteLater()
+        self._rubber_band = None
+        self._rubber_band_origin = None
+
+    def _interaction_axis(self, event):  # noqa: ANN001 - matplotlib event object.
+        if self._interaction_axis_index is None or self._interaction_axis_index >= len(event.canvas.figure.axes):
+            return None
+        return event.canvas.figure.axes[self._interaction_axis_index]
+
+    def _event_display_point(self, event, axis) -> tuple[float, float]:  # noqa: ANN001 - matplotlib objects.
+        x = event.x if event.x is not None else axis.bbox.x0
+        y = event.y if event.y is not None else axis.bbox.y0
+        x = min(max(float(x), axis.bbox.x0), axis.bbox.x1)
+        y = min(max(float(y), axis.bbox.y0), axis.bbox.y1)
+        return x, y
+
+    def _event_data_point(self, event, axis) -> tuple[float, float]:  # noqa: ANN001 - matplotlib objects.
+        return tuple(axis.transData.inverted().transform(self._event_display_point(event, axis)))
+
+    def _event_qpoint(self, event, axis=None) -> QPoint:  # noqa: ANN001 - matplotlib event object.
+        if axis is None:
+            x = event.x
+            y = event.y
+        else:
+            x, y = self._event_display_point(event, axis)
+        return QPoint(int(x), int(event.canvas.height() - y))
 
     def _on_scroll_zoom(self, event) -> None:  # noqa: ANN001 - matplotlib event object.
+        if self._plotting_busy():
+            return
         if event.inaxes is None or event.xdata is None or event.ydata is None:
             return
         toolbar = self._toolbar_for_canvas(event.canvas)
@@ -970,6 +1022,15 @@ class MainWindow(QMainWindow):
         if canvas is self.hist_canvas:
             return self.hist_toolbar
         return None
+
+    def _plotting_busy(self) -> bool:
+        return self._worker_thread is not None or self._hist_thread is not None
+
+    def _set_plot_controls_enabled(self, enabled: bool) -> None:
+        for button in self._plot_control_buttons:
+            button.setEnabled(enabled)
+        self.toolbar.setEnabled(enabled)
+        self.hist_toolbar.setEnabled(enabled)
 
     def _home_limits_for_canvas(self, canvas) -> list[tuple[tuple[float, float], tuple[float, float]]]:  # noqa: ANN001
         if canvas is self.canvas:
