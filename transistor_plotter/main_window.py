@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .data_loader import discover_sensors
-from .histogram_data import HistogramSample, extract_histogram_sample
+from .histogram_data import HISTOGRAM_SPECS, HistogramSample, extract_histogram_sample
 from .models import DeviceCurves, SensorFiles
 from .mosfet_fitting import FitError, fit_triode_eq_5_16
 from .plotting import (
@@ -234,9 +234,7 @@ class MainWindow(QMainWindow):
         self._hist_worker: HistogramWorker | None = None
         self._hist_started = False
         self._hist_loaded = 0
-        self._hist_gate_ig: list[float] = []
-        self._hist_transfer_id: list[float] = []
-        self._hist_output_id: list[float] = []
+        self._hist_values: dict[str, list[float]] = {spec.key: [] for spec in HISTOGRAM_SPECS}
         self._curve_home_limits: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._hist_home_limits: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._hover_canvas: FigureCanvas | None = None
@@ -301,7 +299,7 @@ class MainWindow(QMainWindow):
         self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
 
-        self.hist_figure = Figure(figsize=(10, 6), constrained_layout=False)
+        self.hist_figure = Figure(figsize=(12, 7), constrained_layout=False)
         self.hist_canvas = FigureCanvas(self.hist_figure)
         self.hist_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.hist_toolbar = NavigationToolbar(self.hist_canvas, self)
@@ -368,8 +366,17 @@ class MainWindow(QMainWindow):
         histogram_layout.addWidget(
             self._build_plot_controls(
                 self.hist_canvas,
-                ("Gate Ig", "Transfer Id", "Output Id"),
-                columns=3,
+                (
+                    "DIODE Ig 0V",
+                    "DIODE Ig 0.5V",
+                    "TRANS Id 0.1V",
+                    "TRANS Id 0.5V",
+                    "TRANS Id 0.9V",
+                    "IV Id -0.3V",
+                    "IV Id 0.1V",
+                    "IV Id 0.5V",
+                ),
+                columns=4,
             )
         )
 
@@ -690,14 +697,10 @@ class MainWindow(QMainWindow):
         self._set_plot_controls_enabled(False)
         self._hist_started = True
         self._hist_loaded = 0
-        self._hist_gate_ig.clear()
-        self._hist_transfer_id.clear()
-        self._hist_output_id.clear()
+        self._hist_values = {spec.key: [] for spec in HISTOGRAM_SPECS}
         plot_histograms(
             self.hist_figure,
-            self._hist_gate_ig,
-            self._hist_transfer_id,
-            self._hist_output_id,
+            self._hist_values,
             loaded_count=0,
         )
         self._remember_home_limits(self.hist_canvas)
@@ -738,17 +741,13 @@ class MainWindow(QMainWindow):
     def _on_hist_batch_ready(self, samples: list[HistogramSample]) -> None:
         for sample in samples:
             self._hist_loaded += 1
-            if sample.gate_ig is not None:
-                self._hist_gate_ig.append(sample.gate_ig)
-            if sample.transfer_id is not None:
-                self._hist_transfer_id.append(sample.transfer_id)
-            if sample.output_id is not None:
-                self._hist_output_id.append(sample.output_id)
+            for spec in HISTOGRAM_SPECS:
+                value = sample.values.get(spec.key)
+                if value is not None:
+                    self._hist_values[spec.key].append(value)
         plot_histograms(
             self.hist_figure,
-            self._hist_gate_ig,
-            self._hist_transfer_id,
-            self._hist_output_id,
+            self._hist_values,
             loaded_count=self._hist_loaded,
         )
         self._remember_home_limits(self.hist_canvas)
@@ -758,9 +757,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         plot_histograms(
             self.hist_figure,
-            self._hist_gate_ig,
-            self._hist_transfer_id,
-            self._hist_output_id,
+            self._hist_values,
             loaded_count=self._hist_loaded,
         )
         self._remember_home_limits(self.hist_canvas)

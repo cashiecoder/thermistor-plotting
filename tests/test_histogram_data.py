@@ -30,6 +30,7 @@ class HistogramDataTests(unittest.TestCase):
                 "Vds",
                 "Id",
                 (
+                    Curve("VGS = -0.300 V", x_vds, np.array([1.0, 5.0])),
                     Curve("VGS = 0.100 V", x_vds, np.array([10.0, 30.0])),
                     Curve("VGS = 0.500 V", x_vds, np.array([20.0, 60.0])),
                 ),
@@ -39,6 +40,7 @@ class HistogramDataTests(unittest.TestCase):
                 "Vgs",
                 "Id",
                 (
+                    Curve("VDS = 0.100 V", x_vgs, np.array([3.0, 5.0])),
                     Curve("VDS = 0.500 V", x_vgs, np.array([4.0, 8.0])),
                     Curve("VDS = 0.900 V", x_vgs, np.array([5.0, 15.0])),
                 ),
@@ -47,9 +49,14 @@ class HistogramDataTests(unittest.TestCase):
         )
 
         sample = extract_histogram_sample(device)
-        self.assertAlmostEqual(sample.gate_ig, 4.0)
-        self.assertAlmostEqual(sample.transfer_id, 10.0)
-        self.assertAlmostEqual(sample.output_id, 20.0)
+        self.assertAlmostEqual(sample.values["diode_ig_vds_0p0"], 2.0)
+        self.assertAlmostEqual(sample.values["diode_ig_vds_0p5"], 4.0)
+        self.assertAlmostEqual(sample.values["trans_id_vds_0p1"], 4.0)
+        self.assertAlmostEqual(sample.values["trans_id_vds_0p5"], 6.0)
+        self.assertAlmostEqual(sample.values["trans_id_vds_0p9"], 10.0)
+        self.assertAlmostEqual(sample.values["iv_id_vgs_n0p3"], 3.0)
+        self.assertAlmostEqual(sample.values["iv_id_vgs_0p1"], 20.0)
+        self.assertAlmostEqual(sample.values["iv_id_vgs_0p5"], 40.0)
 
 
 if __name__ == "__main__":

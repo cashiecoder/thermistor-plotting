@@ -10,10 +10,7 @@ from matplotlib.figure import Figure
 
 from .bias import parse_bias_value
 from .histogram_data import (
-    HISTOGRAM_DIODE_VDS,
-    HISTOGRAM_TRANSFER_VDS,
-    HISTOGRAM_VDS,
-    HISTOGRAM_VGS,
+    HISTOGRAM_SPECS,
 )
 from .ideal_mosfet import ideal_gate_leakage, ideal_gm, ideal_id, validate_reference_params
 from .models import DeviceCurves
@@ -138,51 +135,52 @@ def finish_overlay_figure(figure: Figure, title: str, count: int) -> None:
 
 def plot_histograms(
     figure: Figure,
-    gate_ig: list[float],
-    transfer_id: list[float],
-    output_id: list[float],
+    histogram_values: dict[str, list[float]],
     *,
     loaded_count: int,
 ) -> None:
     figure.clear()
     figure.patch.set_facecolor(FIGURE_BG)
-    axes = list(figure.subplots(1, 3))
-    specs = [
-        (
-            gate_ig,
-            f"Ig @ Vgs={HISTOGRAM_VGS:+.1f} V, Vds={HISTOGRAM_DIODE_VDS:+.1f} V",
-            "Ig (uA/mm)",
-            "#ff7f0e",
-        ),
-        (
-            transfer_id,
-            f"Id transfer @ Vgs={HISTOGRAM_VGS:+.1f} V, Vds={HISTOGRAM_TRANSFER_VDS:+.1f} V",
-            "Id (mA/mm)",
-            "#2ca02c",
-        ),
-        (
-            output_id,
-            f"Id output @ Vds={HISTOGRAM_VDS:+.1f} V, Vgs={HISTOGRAM_VGS:+.1f} V",
-            "Id (mA/mm)",
-            "#1f77b4",
-        ),
-    ]
-    for ax, (values, title, xlabel, color) in zip(axes, specs, strict=True):
+    axes = list(figure.subplots(2, 4).flat)
+    for ax, spec in zip(axes, HISTOGRAM_SPECS, strict=True):
         ax.set_facecolor(AXES_BG)
         ax.grid(True, alpha=0.22, color=GRID_COLOR)
         ax.tick_params(colors=MUTED_TEXT)
         for spine in ax.spines.values():
             spine.set_color("#4b5563")
+        values = histogram_values.get(spec.key, [])
         finite_values = np.asarray(values, dtype=float)
         finite_values = finite_values[np.isfinite(finite_values)]
         if len(finite_values) > 0:
-            ax.hist(finite_values, bins="auto", color=color, alpha=0.82, edgecolor="#0f172a", linewidth=0.7)
-        ax.set_title(f"{title}\nn={len(finite_values):,}", fontsize=10, fontweight="bold", color=TEXT_COLOR)
-        ax.set_xlabel(xlabel, color=MUTED_TEXT)
+            ax.hist(finite_values, bins="auto", color=spec.color, alpha=0.82, edgecolor="#0f172a", linewidth=0.7)
+            rms_text = f"RMS={_format_metric(_rms(finite_values))}"
+        else:
+            rms_text = "RMS=n/a"
+        ax.text(
+            0.98,
+            0.95,
+            f"n={len(finite_values):,}\n{rms_text}",
+            ha="right",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=8,
+            color=TEXT_COLOR,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "#0f172a", "edgecolor": "#334155", "alpha": 0.82},
+        )
+        ax.set_title(spec.title, fontsize=9, fontweight="bold", color=TEXT_COLOR)
+        ax.set_xlabel(spec.xlabel, color=MUTED_TEXT)
         ax.set_ylabel("Sensor count", color=MUTED_TEXT)
 
     figure.suptitle(f"Histogram distributions ({loaded_count:,} sensors loaded)", fontsize=13, fontweight="bold", color=TEXT_COLOR)
     figure.tight_layout(pad=1.35)
+
+
+def _rms(values: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(values))))
+
+
+def _format_metric(value: float) -> str:
+    return f"{value:.4g}"
 
 
 def _curve_color(curve_index: int) -> str:
