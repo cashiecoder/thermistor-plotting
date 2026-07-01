@@ -138,6 +138,7 @@ def plot_histograms(
     histogram_values: dict[str, list[float]],
     *,
     loaded_count: int,
+    log_scale: bool = False,
 ) -> None:
     figure.clear()
     figure.patch.set_facecolor(FIGURE_BG)
@@ -156,6 +157,8 @@ def plot_histograms(
             rms_text = f"RMS={_format_metric(_rms(finite_values))}"
         else:
             rms_text = "RMS=n/a"
+        if log_scale:
+            ax.set_yscale("log")
         ax.text(
             0.98,
             0.95,
@@ -171,7 +174,13 @@ def plot_histograms(
         ax.set_xlabel(spec.xlabel, color=MUTED_TEXT)
         ax.set_ylabel("Sensor count", color=MUTED_TEXT)
 
-    figure.suptitle(f"Histogram distributions ({loaded_count:,} sensors loaded)", fontsize=13, fontweight="bold", color=TEXT_COLOR)
+    scale_label = "log count" if log_scale else "linear count"
+    figure.suptitle(
+        f"Histogram distributions ({loaded_count:,} sensors loaded, {scale_label})",
+        fontsize=13,
+        fontweight="bold",
+        color=TEXT_COLOR,
+    )
     figure.tight_layout(pad=1.35)
 
 

@@ -235,6 +235,7 @@ class MainWindow(QMainWindow):
         self._hist_started = False
         self._hist_loaded = 0
         self._hist_values: dict[str, list[float]] = {spec.key: [] for spec in HISTOGRAM_SPECS}
+        self._hist_log_scale = False
         self._curve_home_limits: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._hist_home_limits: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._hover_canvas: FigureCanvas | None = None
@@ -286,6 +287,10 @@ class MainWindow(QMainWindow):
         self.stop_hist_button.setToolTip("Cancel the background histogram build.")
         self.stop_hist_button.clicked.connect(self._cancel_histograms)
         self.stop_hist_button.setVisible(False)
+
+        self.hist_scale_button = QPushButton("Hist Scale: Linear")
+        self.hist_scale_button.setToolTip("Toggle histogram sensor-count axis between linear and log scale.")
+        self.hist_scale_button.clicked.connect(self._toggle_histogram_scale)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -361,7 +366,13 @@ class MainWindow(QMainWindow):
         histogram_layout = QVBoxLayout(histogram_area)
         histogram_layout.setContentsMargins(10, 8, 10, 10)
         histogram_layout.setSpacing(8)
-        histogram_layout.addWidget(self.hist_toolbar)
+        histogram_tools = QWidget()
+        histogram_tools_layout = QHBoxLayout(histogram_tools)
+        histogram_tools_layout.setContentsMargins(0, 0, 0, 0)
+        histogram_tools_layout.setSpacing(8)
+        histogram_tools_layout.addWidget(self.hist_toolbar, stretch=1)
+        histogram_tools_layout.addWidget(self.hist_scale_button)
+        histogram_layout.addWidget(histogram_tools)
         histogram_layout.addWidget(self.hist_canvas, stretch=1)
         histogram_layout.addWidget(
             self._build_plot_controls(
@@ -687,6 +698,25 @@ class MainWindow(QMainWindow):
         canvas.draw_idle()
         self.statusBar().showMessage("Reset zoom for one plot.", 4000)
 
+    def _toggle_histogram_scale(self) -> None:
+        self._hist_log_scale = not self._hist_log_scale
+        self.hist_scale_button.setText("Hist Scale: Log" if self._hist_log_scale else "Hist Scale: Linear")
+        self._redraw_histograms()
+        self.statusBar().showMessage(
+            "Histogram count axis set to log scale." if self._hist_log_scale else "Histogram count axis set to linear scale.",
+            4000,
+        )
+
+    def _redraw_histograms(self) -> None:
+        plot_histograms(
+            self.hist_figure,
+            self._hist_values,
+            loaded_count=self._hist_loaded,
+            log_scale=self._hist_log_scale,
+        )
+        self._remember_home_limits(self.hist_canvas)
+        self.hist_canvas.draw_idle()
+
     def _start_histograms(self) -> None:
         if self._hist_thread is not None:
             return
@@ -702,6 +732,7 @@ class MainWindow(QMainWindow):
             self.hist_figure,
             self._hist_values,
             loaded_count=0,
+            log_scale=self._hist_log_scale,
         )
         self._remember_home_limits(self.hist_canvas)
         self.hist_canvas.draw_idle()
@@ -749,6 +780,7 @@ class MainWindow(QMainWindow):
             self.hist_figure,
             self._hist_values,
             loaded_count=self._hist_loaded,
+            log_scale=self._hist_log_scale,
         )
         self._remember_home_limits(self.hist_canvas)
         self.hist_canvas.draw_idle()
@@ -759,6 +791,7 @@ class MainWindow(QMainWindow):
             self.hist_figure,
             self._hist_values,
             loaded_count=self._hist_loaded,
+            log_scale=self._hist_log_scale,
         )
         self._remember_home_limits(self.hist_canvas)
         self.hist_canvas.draw_idle()

@@ -26,7 +26,7 @@ Check `Fit ideal MOSFET reference` to immediately replot the selected sensor wit
 
 The sensor list is indexed from complete DIODE/IV/TRANS file triples. Use search to filter the list, `Plot Selected` for one device, `Plot Filtered` for only the sensors currently visible in the list, or `Plot All Sensors` for a full overlay on the same four axes. Bulk plots run in the background; the active bulk button becomes `Cancel` while it is loading. The background loader uses `CPU_CORE_DIVISOR` in `transistor_plotter/main_window.py`; set it to `8` for about one eighth of available cores or `4` for about one quarter.
 
-Use the `Histograms` tab to view distributions across all sensors at the whiteboard voltage points. Opening the tab does not start processing; click `Start Histograms` when you want to build them. Histogram building runs in the background, can be cancelled with `Stop Histograms`, and can be rerun with `Rebuild Histograms`. Each histogram displays the finite sample count and RMS.
+Use the `Histograms` tab to view distributions across all sensors at the whiteboard voltage points. Opening the tab does not start processing; click `Start Histograms` when you want to build them. Histogram building runs in the background, can be cancelled with `Stop Histograms`, and can be rerun with `Rebuild Histograms`. Each histogram displays the finite sample count and RMS. Use `Hist Scale` to toggle the histogram count axis between linear and log scale.
 
 - gate leakage `Ig` at `Vgs = +0.1 V` using DIODE `VDS = 0 V` and `0.5 V`
 - transfer `Id` at `Vgs = +0.1 V` using TRANS `VDS = 0.1 V`, `0.5 V`, and `0.9 V`
