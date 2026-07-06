@@ -12,6 +12,8 @@ from transistor_plotter.mosfet_fitting import (
     fit_reference_from_transfer_regions,
     fit_saturation_largest_vds,
     fit_triode_eq_5_16,
+    fit_triode_largest_vds_in_id_window,
+    fit_triode_smallest_vds_in_id_window,
 )
 
 
@@ -38,6 +40,20 @@ class MosfetFittingTests(unittest.TestCase):
         self.assertEqual(result.saturation.method.startswith("Eq. 5.20 saturation fit, green"), True)
         self.assertAlmostEqual(result.triode.vth, 0.25, places=10)
         self.assertAlmostEqual(result.saturation.vth, 0.25, places=10)
+
+    def test_green_triode_fit_recovers_synthetic_parameters(self) -> None:
+        device = _green_triode_device(vth=0.25, k=12.0)
+        result = fit_triode_largest_vds_in_id_window(device, id_min=0.0, id_max=1000.0)
+        self.assertAlmostEqual(result.vth, 0.25, places=10)
+        self.assertAlmostEqual(result.k, 12.0, places=10)
+        self.assertGreater(result.points_used, 2)
+
+    def test_blue_triode_fit_recovers_synthetic_parameters(self) -> None:
+        device = _synthetic_device(vth=0.25, k=12.0)
+        result = fit_triode_smallest_vds_in_id_window(device, id_min=0.0, id_max=1000.0)
+        self.assertAlmostEqual(result.vth, 0.25, places=10)
+        self.assertAlmostEqual(result.k, 12.0, places=10)
+        self.assertGreater(result.points_used, 2)
 
     def test_missing_vds_labels_raise_clear_error(self) -> None:
         sensor = SensorFiles("test", "missing", Path("d"), Path("i"), Path("t"))
@@ -67,6 +83,16 @@ def _synthetic_device(vth: float, k: float) -> DeviceCurves:
     curves.append(Curve("VDS = 2.000 V", saturation_vgs, ideal_id(saturation_vgs, 2.0, vth=vth, k=k)))
 
     transfer = CurveSet("Transfer", "Vgs", "Id", tuple(curves))
+    return DeviceCurves(sensor, empty, empty, transfer, empty)
+
+
+def _green_triode_device(vth: float, k: float) -> DeviceCurves:
+    sensor = SensorFiles("test", "synthetic", Path("d"), Path("i"), Path("t"))
+    empty = CurveSet("", "", "", ())
+    vgs = np.linspace(0.6, 1.4, 20)
+    vds = 0.1
+    ids = k * ((vgs - vth) * vds - 0.5 * vds**2)
+    transfer = CurveSet("Transfer", "Vgs", "Id", (Curve("VDS = 0.100 V", vgs, ids),))
     return DeviceCurves(sensor, empty, empty, transfer, empty)
 
 

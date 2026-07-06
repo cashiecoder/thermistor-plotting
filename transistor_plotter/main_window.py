@@ -11,10 +11,11 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from PyQt6.QtCore import QPoint, QRect, QObject, QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtGui import QColor, QMouseEvent, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QGridLayout,
     QHBoxLayout,
@@ -28,7 +29,6 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QRubberBand,
     QSizePolicy,
-    QSlider,
     QStatusBar,
     QTabWidget,
     QVBoxLayout,
@@ -38,7 +38,13 @@ from PyQt6.QtWidgets import (
 from .data_loader import discover_sensors
 from .histogram_data import HISTOGRAM_SPECS, HistogramSample, extract_histogram_sample
 from .models import DeviceCurves, SensorFiles
-from .mosfet_fitting import FitError, fit_reference_from_transfer_regions
+from .mosfet_fitting import (
+    FitError,
+    MosfetReferenceFit,
+    fit_saturation_largest_vds_in_id_window,
+    fit_triode_largest_vds_in_id_window,
+    fit_triode_smallest_vds_in_id_window,
+)
 from .plotting import (
     TEXT_COLOR,
     add_overlay_devices,
@@ -55,7 +61,109 @@ from .sqlite_cache import CacheMemoryError, SQLiteCurveCache
 CPU_CORE_DIVISOR = 4
 BULK_BATCH_SIZE = 50
 FIT_THRESHOLD_DEFAULT = 10
+FIT_THRESHOLD_MAX_DEFAULT = 1000
 FIT_THRESHOLD_MAX = 1000
+FIT_THRESHOLD_STEP = 10
+FIT_MODE_GREEN_SAT = 0
+FIT_MODE_GREEN_TRI = 1
+FIT_MODE_BLUE_TRI = 2
+
+
+class IdRangeSlider(QWidget):
+    valueChanged = pyqtSignal(int, int)
+    sliderReleased = pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        minimum: int,
+        maximum: int,
+        low: int,
+        high: int,
+        step: int,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._minimum = minimum
+        self._maximum = maximum
+        self._low = low
+        self._high = high
+        self._step = step
+        self._active_handle: str | None = None
+        self.setMinimumHeight(28)
+        self.setMouseTracking(True)
+
+    def low_value(self) -> int:
+        return self._low
+
+    def high_value(self) -> int:
+        return self._high
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        y = self.height() // 2
+        left, right = self._track_bounds()
+        low_x = self._x_from_value(self._low)
+        high_x = self._x_from_value(self._high)
+
+        painter.setPen(QPen(QColor("#334155"), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(left, y, right, y)
+        painter.setPen(QPen(QColor("#60a5fa"), 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(low_x, y, high_x, y)
+        painter.setPen(QPen(QColor("#93c5fd"), 1))
+        painter.setBrush(QColor("#1d4ed8"))
+        painter.drawEllipse(QPoint(low_x, y), 7, 7)
+        painter.drawEllipse(QPoint(high_x, y), 7, 7)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override.
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        x = int(event.position().x())
+        low_distance = abs(x - self._x_from_value(self._low))
+        high_distance = abs(x - self._x_from_value(self._high))
+        self._active_handle = "low" if low_distance <= high_distance else "high"
+        self._move_active_handle(x)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override.
+        if self._active_handle is None:
+            return
+        self._move_active_handle(int(event.position().x()))
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override.
+        if event.button() == Qt.MouseButton.LeftButton and self._active_handle is not None:
+            self._active_handle = None
+            self.sliderReleased.emit()
+
+    def _move_active_handle(self, x: int) -> None:
+        value = self._snap_value(self._value_from_x(x))
+        old_low, old_high = self._low, self._high
+        if self._active_handle == "low":
+            self._low = min(max(value, self._minimum), self._high - self._step)
+        elif self._active_handle == "high":
+            self._high = max(min(value, self._maximum), self._low + self._step)
+        if (self._low, self._high) != (old_low, old_high):
+            self.valueChanged.emit(self._low, self._high)
+            self.update()
+
+    def _track_bounds(self) -> tuple[int, int]:
+        margin = 12
+        return margin, max(margin + 1, self.width() - margin)
+
+    def _x_from_value(self, value: int) -> int:
+        left, right = self._track_bounds()
+        fraction = (value - self._minimum) / (self._maximum - self._minimum)
+        return int(round(left + fraction * (right - left)))
+
+    def _value_from_x(self, x: int) -> int:
+        left, right = self._track_bounds()
+        clamped_x = min(max(x, left), right)
+        fraction = (clamped_x - left) / (right - left)
+        return int(round(self._minimum + fraction * (self._maximum - self._minimum)))
+
+    def _snap_value(self, value: int) -> int:
+        return int(round(value / self._step) * self._step)
 
 
 class LoadAllWorker(QObject):
@@ -270,14 +378,21 @@ class MainWindow(QMainWindow):
         )
         self.reference_checkbox.toggled.connect(self._on_reference_toggled)
 
-        self.fit_threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self.fit_threshold_slider.setRange(0, FIT_THRESHOLD_MAX)
-        self.fit_threshold_slider.setValue(FIT_THRESHOLD_DEFAULT)
-        self.fit_threshold_slider.setSingleStep(1)
-        self.fit_threshold_slider.setPageStep(10)
-        self.fit_threshold_slider.setToolTip("Minimum Id used for selected-device MOSFET fits.")
-        self.fit_threshold_slider.valueChanged.connect(self._update_fit_threshold_label)
-        self.fit_threshold_slider.sliderReleased.connect(self._on_fit_threshold_changed)
+        self.fit_mode_group = QButtonGroup(self)
+        self.fit_mode_group.setExclusive(True)
+        self.fit_mode_buttons = self._build_fit_mode_buttons()
+        self.fit_mode_group.idClicked.connect(self._on_fit_mode_changed)
+
+        self.fit_id_range_slider = IdRangeSlider(
+            minimum=0,
+            maximum=FIT_THRESHOLD_MAX,
+            low=FIT_THRESHOLD_DEFAULT,
+            high=FIT_THRESHOLD_MAX_DEFAULT,
+            step=FIT_THRESHOLD_STEP,
+        )
+        self.fit_id_range_slider.setToolTip("Current window used for the selected-device green-curve fit.")
+        self.fit_id_range_slider.valueChanged.connect(self._on_fit_range_value_changed)
+        self.fit_id_range_slider.sliderReleased.connect(self._on_fit_threshold_changed)
 
         self.fit_result_label = QLabel("Fit: not run")
         self.fit_result_label.setObjectName("fitResultLabel")
@@ -360,8 +475,9 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.count_label)
         sidebar_layout.addWidget(self.sensor_list, stretch=1)
         sidebar_layout.addWidget(self.reference_checkbox)
+        sidebar_layout.addWidget(self.fit_mode_buttons)
         sidebar_layout.addWidget(self.fit_threshold_label)
-        sidebar_layout.addWidget(self.fit_threshold_slider)
+        sidebar_layout.addWidget(self.fit_id_range_slider)
         sidebar_layout.addWidget(self.fit_result_label)
         sidebar_layout.addWidget(self.plot_selected_button)
         sidebar_layout.addWidget(self.plot_filtered_button)
@@ -459,6 +575,27 @@ class MainWindow(QMainWindow):
             grid.addWidget(cell, row, column)
         return container
 
+    def _build_fit_mode_buttons(self) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        options = (
+            (FIT_MODE_GREEN_SAT, "Green Sat", "Fit green largest-VDS curve with Eq. 5.20 saturation."),
+            (FIT_MODE_GREEN_TRI, "Green Tri", "Fit green largest-VDS curve with Eq. 5.16 triode."),
+            (FIT_MODE_BLUE_TRI, "Blue Tri", "Fit blue smallest-VDS curve with Eq. 5.16 triode."),
+        )
+        for mode_id, text, tooltip in options:
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.setToolTip(tooltip)
+            button.setObjectName("segmentedButton")
+            self.fit_mode_group.addButton(button, mode_id)
+            layout.addWidget(button)
+        self.fit_mode_group.button(FIT_MODE_GREEN_SAT).setChecked(True)
+        return container
+
     def apply_filter(self) -> None:
         query = self.search_edit.text().strip().lower()
         self.filtered_sensors = [
@@ -508,8 +645,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Fitting and plotting selected sensor..." if checked else "Plotting selected sensor...")
         self.plot_selected()
 
+    def _on_fit_mode_changed(self) -> None:
+        if not self.reference_checkbox.isChecked():
+            return
+        if self._worker_thread is not None or self._hist_thread is not None:
+            self.statusBar().showMessage("Wait for the background job before changing the fit mode.", 5000)
+            return
+        self.statusBar().showMessage("Refitting selected sensor with new fit mode...")
+        self.plot_selected()
+
+    def _on_fit_range_value_changed(self, low: int | None = None, high: int | None = None) -> None:
+        del low, high
+        self._update_fit_threshold_label()
+
+    def _fit_id_min(self) -> float:
+        return float(self.fit_id_range_slider.low_value())
+
+    def _fit_id_max(self) -> float:
+        return float(self.fit_id_range_slider.high_value())
+
     def _update_fit_threshold_label(self) -> None:
-        self.fit_threshold_label.setText(f"Fit Id min: {self.fit_threshold_slider.value()} mA/mm")
+        self.fit_threshold_label.setText(f"Fit Id range: {self._fit_id_min():.0f}-{self._fit_id_max():.0f} mA/mm")
 
     def _on_fit_threshold_changed(self) -> None:
         if not self.reference_checkbox.isChecked():
@@ -521,8 +677,15 @@ class MainWindow(QMainWindow):
         self.plot_selected()
 
     def _fit_reference(self, device: DeviceCurves):
-        id_threshold = float(self.fit_threshold_slider.value())
-        return fit_reference_from_transfer_regions(device, id_threshold=id_threshold)
+        mode = self.fit_mode_group.checkedId()
+        if mode == FIT_MODE_BLUE_TRI:
+            fit_function = fit_triode_smallest_vds_in_id_window
+        elif mode == FIT_MODE_GREEN_TRI:
+            fit_function = fit_triode_largest_vds_in_id_window
+        else:
+            fit_function = fit_saturation_largest_vds_in_id_window
+        fit_result = fit_function(device, id_min=self._fit_id_min(), id_max=self._fit_id_max())
+        return MosfetReferenceFit(saturation=fit_result)
 
     def _load_selected_device(self) -> tuple[SensorFiles, DeviceCurves]:
         item = self.sensor_list.currentItem()
@@ -556,10 +719,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Plotted {sensor.label}", 5000)
         else:
             fit_message = (
-                f"Triode blue: Vt={fit_result.triode.vth:.5g} V, "
-                f"k={fit_result.triode.k:.5g}, pts={fit_result.triode.points_used}, "
-                f"RMS={fit_result.triode.rms_error:.5g}\n"
-                f"Saturation green: Vt={fit_result.saturation.vth:.5g} V, "
+                f"Green fit: Vt={fit_result.saturation.vth:.5g} V, "
                 f"k={fit_result.saturation.k:.5g}, pts={fit_result.saturation.points_used}, "
                 f"RMS={fit_result.saturation.rms_error:.5g}"
             )
@@ -1259,6 +1419,15 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #64748b;
             background: #1f2937;
             border-color: #334155;
+        }
+        QPushButton#segmentedButton {
+            border-radius: 0;
+            padding: 7px 5px;
+        }
+        QPushButton#segmentedButton:checked {
+            background: #2563eb;
+            border-color: #60a5fa;
+            color: #ffffff;
         }
         QProgressBar {
             color: #f8fafc;

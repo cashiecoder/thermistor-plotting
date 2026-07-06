@@ -22,7 +22,17 @@ For a selected sensor, the app makes one four-panel figure:
 - `Id (mA/mm)` vs `Vgs (V)` from the first TRANS sheet
 - `gm (mS/mm)` vs `Vgs (V)` from the second TRANS sheet
 
-Check `Fit ideal MOSFET reference` to immediately replot the selected sensor with dashed textbook enhancement-NMOS reference curves. The fit uses only TRANS transfer data for one selected device: Sedra/Smith Eq. 5.16 on the blue smallest-`VDS` curve for triode-region parameters, and Eq. 5.20 on the green largest-`VDS` curve for saturation-region parameters. Both fits use only above-threshold points, and the `Fit Id min` slider adjusts the current threshold. The resulting triode and saturation `Vt`/`k` values are then used to draw dashed reference curves on all matching `Id` and `gm` lines. Bulk `Plot All Sensors` and `Plot Filtered` overlays do not include fitted reference curves.
+Check `Fit ideal MOSFET reference` to immediately replot the selected sensor with dashed textbook enhancement-NMOS reference curves. The fit uses only the bottom-left green largest-`VDS` TRANS transfer curve for one selected device. The `Fit Id range` two-handle slider chooses the current window in 10 mA/mm steps.
+
+Reference fitting mode buttons:
+
+- `Green Sat`: fits `Id = (1/2) * k * (Vgs - Vt)^2` on the green largest-`VDS` transfer curve inside the selected `Id` window and satisfying `Vds >= Vgs - Vt`. The code solves this by fitting `sqrt(Id) = sqrt(k/2) * Vgs - sqrt(k/2) * Vt` with least squares, then iterates the saturation-region mask because `Vt` is part of the mask.
+- `Green Tri`: fits `Id = k * ((Vgs - Vt) * Vds - (1/2) * Vds^2)` on the green largest-`VDS` transfer curve inside the selected `Id` window and satisfying `Vds < Vgs - Vt`. If the green curve never satisfies `Vds < Vgs - Vt`, the app reports that there are not enough triode-region points rather than fitting the wrong region.
+- `Blue Tri`: fits the same Eq. 5.16 triode model on the blue smallest-`VDS` transfer curve. This is usually the better choice when you want a triode fit from TRANS data, because low `VDS` is much more likely to satisfy `Vds < Vgs - Vt`.
+- For both triode modes, with constant curve `Vds`, the code solves the linear least-squares form `Id = k * (Vgs * Vds - (1/2) * Vds^2) - k * Vt * Vds`, then iterates the triode-region mask.
+- After either mode, the fitted `Vt` and `k` are used for the dashed references. The upper-right output reference curves draw only the triode segment from `Vds = 0` to `Vov = Vgs - Vt`, stopping at the overdrive voltage instead of continuing into saturation.
+
+Bulk `Plot All Sensors` and `Plot Filtered` overlays do not include fitted reference curves.
 
 The sensor list is indexed from complete DIODE/IV/TRANS file triples. Use search to filter the list, `Plot Selected` for one device, `Plot Filtered` for only the sensors currently visible in the list, or `Plot All Sensors` for a full overlay on the same four axes. Bulk plots run in the background; the active bulk button becomes `Cancel` while it is loading. The background loader uses `CPU_CORE_DIVISOR` in `transistor_plotter/main_window.py`; set it to `8` for about one eighth of available cores or `4` for about one quarter.
 

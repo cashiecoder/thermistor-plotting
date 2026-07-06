@@ -233,16 +233,28 @@ def _add_gate_leakage_reference(ax: Axes, device: DeviceCurves) -> None:
 
 def _add_output_references(ax: Axes, device: DeviceCurves, reference_fit: MosfetReferenceFit) -> None:
     label_used = False
+    fit = reference_fit.saturation
     for curve_index, curve in enumerate(device.iv_id_vds.curves):
         vgs = parse_bias_value(curve.label, "VGS")
         if vgs is None:
             logging.warning("Skipping ideal output reference; could not parse VGS from label %r.", curve.label)
             continue
+        vov = vgs - fit.vth
+        if vov <= 0.0:
+            continue
+        curve_x = np.asarray(curve.x, dtype=float)
+        finite_x = curve_x[np.isfinite(curve_x)]
+        if finite_x.size == 0:
+            continue
+        max_vds = min(float(np.max(finite_x)), float(vov))
+        if max_vds <= 0.0:
+            continue
+        x = np.linspace(0.0, max_vds, 80)
         label = REFERENCE_LABEL if not label_used else "_nolegend_"
         label_used = True
         ax.plot(
-            curve.x,
-            _ideal_id_split(vgs, curve.x, reference_fit),
+            x,
+            fit.k * ((vgs - fit.vth) * x - 0.5 * x**2),
             linestyle="--",
             linewidth=1.25,
             color=_curve_color(curve_index),
@@ -252,6 +264,7 @@ def _add_output_references(ax: Axes, device: DeviceCurves, reference_fit: Mosfet
 
 def _add_transfer_references(ax: Axes, device: DeviceCurves, reference_fit: MosfetReferenceFit) -> None:
     label_used = False
+    fit = reference_fit.saturation
     for curve_index, curve in enumerate(device.trans_id_vgs.curves):
         vds = parse_bias_value(curve.label, "VDS")
         if vds is None:
@@ -261,7 +274,7 @@ def _add_transfer_references(ax: Axes, device: DeviceCurves, reference_fit: Mosf
         label_used = True
         ax.plot(
             curve.x,
-            _ideal_id_split(curve.x, vds, reference_fit),
+            ideal_id(curve.x, vds, vth=fit.vth, k=fit.k),
             linestyle="--",
             linewidth=1.25,
             color=_curve_color(curve_index),
@@ -271,6 +284,7 @@ def _add_transfer_references(ax: Axes, device: DeviceCurves, reference_fit: Mosf
 
 def _add_gm_references(ax: Axes, device: DeviceCurves, reference_fit: MosfetReferenceFit) -> None:
     label_used = False
+    fit = reference_fit.saturation
     for curve_index, curve in enumerate(device.trans_gm_vgs.curves):
         vds = parse_bias_value(curve.label, "VDS")
         if vds is None:
@@ -280,7 +294,7 @@ def _add_gm_references(ax: Axes, device: DeviceCurves, reference_fit: MosfetRefe
         label_used = True
         ax.plot(
             curve.x,
-            _ideal_gm_split(curve.x, vds, reference_fit),
+            ideal_gm(curve.x, vds, vth=fit.vth, k=fit.k),
             linestyle="--",
             linewidth=1.25,
             color=_curve_color(curve_index),
