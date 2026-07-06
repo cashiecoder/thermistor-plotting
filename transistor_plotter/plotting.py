@@ -14,6 +14,7 @@ from .histogram_data import (
 )
 from .ideal_mosfet import ideal_gate_leakage, ideal_gm, ideal_id, validate_reference_params
 from .models import DeviceCurves
+from .mosfet_fitting import MosfetReferenceFit
 
 FIGURE_BG = "#111827"
 AXES_BG = "#172033"
@@ -60,15 +61,17 @@ def plot_single_device(
     device: DeviceCurves,
     *,
     show_reference: bool = False,
+    reference_fit: MosfetReferenceFit | None = None,
     reference_vth: float | None = None,
     reference_k: float | None = None,
 ) -> None:
     if show_reference:
-        if reference_vth is None:
+        if reference_fit is None and reference_vth is None:
             raise ValueError("reference_vth must be provided when ideal reference overlay is enabled.")
-        if reference_k is None:
+        if reference_fit is None and reference_k is None:
             raise ValueError("reference_k must be provided when ideal reference overlay is enabled.")
-        validate_reference_params(reference_vth, reference_k)
+        if reference_fit is None:
+            validate_reference_params(reference_vth, reference_k)
 
     axes = configure_figure(figure)
     for ax, panel in zip(axes, device.panels, strict=True):
@@ -76,7 +79,12 @@ def plot_single_device(
             ax.plot(curve.x, curve.y, linewidth=1.8, label=curve.label, color=_curve_color(curve_index))
 
     if show_reference:
-        _add_reference_curves(axes, device, reference_vth, reference_k)
+        if reference_fit is None:
+            reference_fit = MosfetReferenceFit(
+                triode=_legacy_reference_result(reference_vth, reference_k),
+                saturation=_legacy_reference_result(reference_vth, reference_k),
+            )
+        _add_reference_curves(axes, device, reference_fit)
 
     for ax, panel in zip(axes, device.panels, strict=True):
         _finish_axis(ax, panel.title, panel.xlabel, panel.ylabel, show_legend=True)
@@ -196,11 +204,17 @@ def _curve_color(curve_index: int) -> str:
     return CURVE_COLORS[curve_index % len(CURVE_COLORS)]
 
 
-def _add_reference_curves(axes: list[Axes], device: DeviceCurves, vth: float, k: float) -> None:
+def _legacy_reference_result(vth: float, k: float):
+    from .mosfet_fitting import MosfetFitResult
+
+    return MosfetFitResult("manual reference", vth, k, 0, 0.0)
+
+
+def _add_reference_curves(axes: list[Axes], device: DeviceCurves, reference_fit: MosfetReferenceFit) -> None:
     _add_gate_leakage_reference(axes[0], device)
-    _add_output_references(axes[1], device, vth, k)
-    _add_transfer_references(axes[2], device, vth, k)
-    _add_gm_references(axes[3], device, vth, k)
+    _add_output_references(axes[1], device, reference_fit)
+    _add_transfer_references(axes[2], device, reference_fit)
+    _add_gm_references(axes[3], device, reference_fit)
 
 
 def _add_gate_leakage_reference(ax: Axes, device: DeviceCurves) -> None:
@@ -217,7 +231,7 @@ def _add_gate_leakage_reference(ax: Axes, device: DeviceCurves) -> None:
     )
 
 
-def _add_output_references(ax: Axes, device: DeviceCurves, vth: float, k: float) -> None:
+def _add_output_references(ax: Axes, device: DeviceCurves, reference_fit: MosfetReferenceFit) -> None:
     label_used = False
     for curve_index, curve in enumerate(device.iv_id_vds.curves):
         vgs = parse_bias_value(curve.label, "VGS")
@@ -228,7 +242,7 @@ def _add_output_references(ax: Axes, device: DeviceCurves, vth: float, k: float)
         label_used = True
         ax.plot(
             curve.x,
-            ideal_id(vgs, curve.x, vth=vth, k=k),
+            _ideal_id_split(vgs, curve.x, reference_fit),
             linestyle="--",
             linewidth=1.25,
             color=_curve_color(curve_index),
@@ -236,7 +250,7 @@ def _add_output_references(ax: Axes, device: DeviceCurves, vth: float, k: float)
         )
 
 
-def _add_transfer_references(ax: Axes, device: DeviceCurves, vth: float, k: float) -> None:
+def _add_transfer_references(ax: Axes, device: DeviceCurves, reference_fit: MosfetReferenceFit) -> None:
     label_used = False
     for curve_index, curve in enumerate(device.trans_id_vgs.curves):
         vds = parse_bias_value(curve.label, "VDS")
@@ -247,7 +261,7 @@ def _add_transfer_references(ax: Axes, device: DeviceCurves, vth: float, k: floa
         label_used = True
         ax.plot(
             curve.x,
-            ideal_id(curve.x, vds, vth=vth, k=k),
+            _ideal_id_split(curve.x, vds, reference_fit),
             linestyle="--",
             linewidth=1.25,
             color=_curve_color(curve_index),
@@ -255,7 +269,7 @@ def _add_transfer_references(ax: Axes, device: DeviceCurves, vth: float, k: floa
         )
 
 
-def _add_gm_references(ax: Axes, device: DeviceCurves, vth: float, k: float) -> None:
+def _add_gm_references(ax: Axes, device: DeviceCurves, reference_fit: MosfetReferenceFit) -> None:
     label_used = False
     for curve_index, curve in enumerate(device.trans_gm_vgs.curves):
         vds = parse_bias_value(curve.label, "VDS")
@@ -266,12 +280,54 @@ def _add_gm_references(ax: Axes, device: DeviceCurves, vth: float, k: float) -> 
         label_used = True
         ax.plot(
             curve.x,
-            ideal_gm(curve.x, vds, vth=vth, k=k),
+            _ideal_gm_split(curve.x, vds, reference_fit),
             linestyle="--",
             linewidth=1.25,
             color=_curve_color(curve_index),
             label=label,
         )
+
+
+def _ideal_id_split(
+    vgs: np.ndarray | float,
+    vds: np.ndarray | float,
+    reference_fit: MosfetReferenceFit,
+) -> np.ndarray:
+    triode = reference_fit.triode
+    saturation = reference_fit.saturation
+    vgs_arr = np.asarray(vgs, dtype=float)
+    vds_arr = np.asarray(vds, dtype=float)
+    vgs_b, vds_b = np.broadcast_arrays(vgs_arr, vds_arr)
+
+    triode_vov = vgs_b - triode.vth
+    saturation_vov = vgs_b - saturation.vth
+    triode_region = (triode_vov > 0.0) & (vds_b < triode_vov)
+    saturation_region = (~triode_region) & (saturation_vov > 0.0)
+
+    triode_id = ideal_id(vgs_b, vds_b, vth=triode.vth, k=triode.k)
+    saturation_id = 0.5 * saturation.k * saturation_vov**2
+    return np.where(triode_region, triode_id, np.where(saturation_region, saturation_id, 0.0))
+
+
+def _ideal_gm_split(
+    vgs: np.ndarray | float,
+    vds: np.ndarray | float,
+    reference_fit: MosfetReferenceFit,
+) -> np.ndarray:
+    triode = reference_fit.triode
+    saturation = reference_fit.saturation
+    vgs_arr = np.asarray(vgs, dtype=float)
+    vds_arr = np.asarray(vds, dtype=float)
+    vgs_b, vds_b = np.broadcast_arrays(vgs_arr, vds_arr)
+
+    triode_vov = vgs_b - triode.vth
+    saturation_vov = vgs_b - saturation.vth
+    triode_region = (triode_vov > 0.0) & (vds_b < triode_vov)
+    saturation_region = (~triode_region) & (saturation_vov > 0.0)
+
+    triode_gm = ideal_gm(vgs_b, vds_b, vth=triode.vth, k=triode.k)
+    saturation_gm = saturation.k * saturation_vov
+    return np.where(triode_region, triode_gm, np.where(saturation_region, saturation_gm, 0.0))
 
 
 def _finish_axis(ax: Axes, title: str, xlabel: str, ylabel: str, show_legend: bool) -> None:

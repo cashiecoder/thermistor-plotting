@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QRubberBand,
     QSizePolicy,
+    QSlider,
     QStatusBar,
     QTabWidget,
     QVBoxLayout,
@@ -37,7 +38,7 @@ from PyQt6.QtWidgets import (
 from .data_loader import discover_sensors
 from .histogram_data import HISTOGRAM_SPECS, HistogramSample, extract_histogram_sample
 from .models import DeviceCurves, SensorFiles
-from .mosfet_fitting import FitError, fit_triode_eq_5_16
+from .mosfet_fitting import FitError, fit_reference_from_transfer_regions
 from .plotting import (
     TEXT_COLOR,
     add_overlay_devices,
@@ -53,6 +54,8 @@ from .sqlite_cache import CacheMemoryError, SQLiteCurveCache
 # Set to 4 for about 1/4 of cores or 8 for about 1/8 of cores.
 CPU_CORE_DIVISOR = 4
 BULK_BATCH_SIZE = 50
+FIT_THRESHOLD_DEFAULT = 10
+FIT_THRESHOLD_MAX = 1000
 
 
 class LoadAllWorker(QObject):
@@ -267,6 +270,22 @@ class MainWindow(QMainWindow):
         )
         self.reference_checkbox.toggled.connect(self._on_reference_toggled)
 
+        self.fit_threshold_slider = QSlider(Qt.Orientation.Horizontal)
+        self.fit_threshold_slider.setRange(0, FIT_THRESHOLD_MAX)
+        self.fit_threshold_slider.setValue(FIT_THRESHOLD_DEFAULT)
+        self.fit_threshold_slider.setSingleStep(1)
+        self.fit_threshold_slider.setPageStep(10)
+        self.fit_threshold_slider.setToolTip("Minimum Id used for selected-device MOSFET fits.")
+        self.fit_threshold_slider.valueChanged.connect(self._update_fit_threshold_label)
+        self.fit_threshold_slider.sliderReleased.connect(self._on_fit_threshold_changed)
+
+        self.fit_result_label = QLabel("Fit: not run")
+        self.fit_result_label.setObjectName("fitResultLabel")
+        self.fit_result_label.setWordWrap(True)
+
+        self.fit_threshold_label = QLabel()
+        self._update_fit_threshold_label()
+
         self.plot_selected_button = QPushButton("Plot Selected")
         self.plot_selected_button.setToolTip("Plot the currently selected sensor as a four-panel figure.")
         self.plot_selected_button.clicked.connect(self.plot_selected)
@@ -341,6 +360,9 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.count_label)
         sidebar_layout.addWidget(self.sensor_list, stretch=1)
         sidebar_layout.addWidget(self.reference_checkbox)
+        sidebar_layout.addWidget(self.fit_threshold_label)
+        sidebar_layout.addWidget(self.fit_threshold_slider)
+        sidebar_layout.addWidget(self.fit_result_label)
         sidebar_layout.addWidget(self.plot_selected_button)
         sidebar_layout.addWidget(self.plot_filtered_button)
         sidebar_layout.addWidget(self.plot_all_button)
@@ -464,7 +486,7 @@ class MainWindow(QMainWindow):
             return
         try:
             sensor, device = self._load_selected_device()
-            result = fit_triode_eq_5_16(device) if self.reference_checkbox.isChecked() else None
+            result = self._fit_reference(device) if self.reference_checkbox.isChecked() else None
             self._plot_device(sensor, device, fit_result=result)
         except LookupError as exc:
             self.statusBar().showMessage(str(exc), 5000)
@@ -485,6 +507,22 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage("Fitting and plotting selected sensor..." if checked else "Plotting selected sensor...")
         self.plot_selected()
+
+    def _update_fit_threshold_label(self) -> None:
+        self.fit_threshold_label.setText(f"Fit Id min: {self.fit_threshold_slider.value()} mA/mm")
+
+    def _on_fit_threshold_changed(self) -> None:
+        if not self.reference_checkbox.isChecked():
+            return
+        if self._worker_thread is not None or self._hist_thread is not None:
+            self.statusBar().showMessage("Wait for the background job before changing the fit threshold.", 5000)
+            return
+        self.statusBar().showMessage("Refitting selected sensor with new Id threshold...")
+        self.plot_selected()
+
+    def _fit_reference(self, device: DeviceCurves):
+        id_threshold = float(self.fit_threshold_slider.value())
+        return fit_reference_from_transfer_regions(device, id_threshold=id_threshold)
 
     def _load_selected_device(self) -> tuple[SensorFiles, DeviceCurves]:
         item = self.sensor_list.currentItem()
@@ -508,23 +546,25 @@ class MainWindow(QMainWindow):
             self.figure,
             device,
             show_reference=fit_result is not None,
-            reference_vth=fit_result.vth if fit_result is not None else None,
-            reference_k=fit_result.k if fit_result is not None else None,
+            reference_fit=fit_result,
         )
         self._capture_axis_positions()
         self._remember_home_limits(self.canvas)
         self.canvas.draw_idle()
         if fit_result is None:
+            self.fit_result_label.setText("Fit: not run")
             self.statusBar().showMessage(f"Plotted {sensor.label}", 5000)
         else:
-            self.statusBar().showMessage(
-                (
-                    f"{fit_result.method}: Vth={fit_result.vth:.4g} V, "
-                    f"k={fit_result.k:.4g} mA/mm/V^2, points={fit_result.points_used}, "
-                    f"RMS={fit_result.rms_error:.4g} mA/mm"
-                ),
-                12000,
+            fit_message = (
+                f"Triode blue: Vt={fit_result.triode.vth:.5g} V, "
+                f"k={fit_result.triode.k:.5g}, pts={fit_result.triode.points_used}, "
+                f"RMS={fit_result.triode.rms_error:.5g}\n"
+                f"Saturation green: Vt={fit_result.saturation.vth:.5g} V, "
+                f"k={fit_result.saturation.k:.5g}, pts={fit_result.saturation.points_used}, "
+                f"RMS={fit_result.saturation.rms_error:.5g}"
             )
+            self.fit_result_label.setText(fit_message)
+            self.statusBar().showMessage(fit_message.replace("\n", " | "), 12000)
 
     def plot_filtered_sensors(self) -> None:
         if self._handle_active_bulk_button(self.plot_filtered_button):
@@ -1166,6 +1206,13 @@ def apply_dark_theme(app: QApplication) -> None:
             color: #cbd5e1;
             font-weight: 600;
             min-width: 118px;
+        }
+        QLabel#fitResultLabel {
+            background: #172033;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            color: #cbd5e1;
+            padding: 6px;
         }
         QListWidget {
             background: #172033;
