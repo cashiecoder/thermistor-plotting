@@ -10,7 +10,7 @@ from pathlib import Path
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from PyQt6.QtCore import QPoint, QRect, QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QRect, QSize, QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QMouseEvent, QPainter, QPalette, QPen
 from PyQt6.QtWidgets import (
     QApplication,
@@ -45,6 +45,7 @@ from .mosfet_fitting import (
     fit_triode_largest_vds_in_id_window,
     fit_triode_smallest_vds_in_id_window,
 )
+from .operating_point_window import OperatingPointWindow
 from .plotting import (
     TEXT_COLOR,
     add_overlay_devices,
@@ -359,6 +360,7 @@ class MainWindow(QMainWindow):
         self._rubber_band: QRubberBand | None = None
         self._rubber_band_origin: QPoint | None = None
         self._plot_control_buttons: list[QPushButton] = []
+        self._operating_point_window: OperatingPointWindow | None = None
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search device ID or data group")
@@ -412,6 +414,10 @@ class MainWindow(QMainWindow):
         self.plot_filtered_button = QPushButton("Plot Filtered")
         self.plot_filtered_button.setToolTip("Overlay only the sensors currently visible after the search filter.")
         self.plot_filtered_button.clicked.connect(self.plot_filtered_sensors)
+
+        self.operating_point_button = QPushButton("Operating Point Model")
+        self.operating_point_button.setToolTip("Open the separate Vds=0.5 V, Vgs=+0.1 V DC modeling window.")
+        self.operating_point_button.clicked.connect(self.open_operating_point_window)
 
         self.start_hist_button = QPushButton("Start Histograms")
         self.start_hist_button.setToolTip("Build histogram distributions from all sensors.")
@@ -482,6 +488,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.plot_selected_button)
         sidebar_layout.addWidget(self.plot_filtered_button)
         sidebar_layout.addWidget(self.plot_all_button)
+        sidebar_layout.addWidget(self.operating_point_button)
         sidebar_layout.addWidget(self.start_hist_button)
         sidebar_layout.addWidget(self.stop_hist_button)
         sidebar_layout.addWidget(self.progress_bar)
@@ -608,11 +615,19 @@ class MainWindow(QMainWindow):
         for sensor in self.filtered_sensors:
             item = QListWidgetItem(sensor.label)
             item.setData(Qt.ItemDataRole.UserRole, sensor)
+            item.setSizeHint(QSize(0, 26))
             self.sensor_list.addItem(item)
 
         if self.filtered_sensors:
             self.sensor_list.setCurrentRow(0)
         self.count_label.setText(f"{len(self.filtered_sensors):,} shown / {len(self.sensors):,} complete sensors")
+
+    def open_operating_point_window(self) -> None:
+        if self._operating_point_window is None:
+            self._operating_point_window = OperatingPointWindow(self.data_dir, self.sensors, self.curve_cache)
+        self._operating_point_window.show()
+        self._operating_point_window.raise_()
+        self._operating_point_window.activateWindow()
 
     def plot_selected(self) -> None:
         if self._worker_thread is not None:

@@ -34,6 +34,14 @@ Reference fitting mode buttons:
 
 Bulk `Plot All Sensors` and `Plot Filtered` overlays do not include fitted reference curves.
 
+Click `Operating Point Model` to open a separate modeling window with its own sensor sidebar. This window focuses on the normal operating point `Vds = 0.5 V`, `Vgs = +0.1 V`:
+
+- It fits the orange TRANS transfer curve, `Id` vs `Vgs` at `Vds = 0.5 V`.
+- The fitted model is `Id = [(k/2) * (Vgs - Vt)^2] * H(Vgs - Vt)`, where `H(x)=1` for `x>=0` and `H(x)=0` for `x<0`.
+- For each candidate `Vt`, the code requires the operating point `Vgs = +0.1 V` to be above threshold and inside the fit region, limits the fit region to `Vgs < (Vds + Vt) / 2`, solves the best linear `k` by least squares, and keeps the `Vt`/`k` pair with the lowest squared error.
+- The transfer plot shows only the measured orange points used in the fit plus the fitted curve over that same `Vgs` range.
+- The output plot uses the fitted `Vt` and `k` to draw `Id = k * ((Vgs - Vt) * Vds - (1/2) * Vds^2)` for the orange `Vgs = +0.1 V` IV curve, only where `Vds < Vgs - Vt`.
+
 The sensor list is indexed from complete DIODE/IV/TRANS file triples. Use search to filter the list, `Plot Selected` for one device, `Plot Filtered` for only the sensors currently visible in the list, or `Plot All Sensors` for a full overlay on the same four axes. Bulk plots run in the background; the active bulk button becomes `Cancel` while it is loading. The background loader uses `CPU_CORE_DIVISOR` in `transistor_plotter/main_window.py`; set it to `8` for about one eighth of available cores or `4` for about one quarter.
 
 Use the `Histograms` tab to view distributions across all sensors at the whiteboard voltage points. Opening the tab does not start processing; click `Start Histograms` when you want to build them. Histogram building runs in the background, can be cancelled with `Stop Histograms`, and can be rerun with `Rebuild Histograms`. Each histogram displays the finite sample count and RMS. Use `Hist Scale` to toggle the histogram count axis between linear and log scale.
